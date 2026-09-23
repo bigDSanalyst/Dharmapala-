@@ -15,6 +15,7 @@ from observation import observe as observe_effects
 from critic_loop import CriticLoop
 from agent import Agent
 from vrf import GuardNonce
+from lake_critic import which_critic
 
 VOW_SOURCE = """
 vow Dharma
@@ -44,6 +45,7 @@ def main():
     tb = TrajectoryCoSigner("TB", b"tk")
     bp, bh, engine_run = build_engine(tmpdir)
     print(f"[engine] {os.path.basename(bp)} sha={bh[:16]}...")
+    print(f"[critic] active: {which_critic()}")
 
     signer_a = default_signer("Adv_A", b"fb")
     signer_b = default_signer("Adv_B", b"fb")

@@ -1,0 +1,127 @@
+
+import hashlib, hmac, json, os, shutil, subprocess, tempfile
+from dataclasses import dataclass, replace
+
+@dataclass(frozen=True)
+class CoqWitness:
+    name: str; statement: str; engine_output: dict; engine_name: str
+    def __post_init__(self):
+        s = self.statement.strip()
+        if s.startswith("(*") or s.startswith("//"):
+            raise ValueError(f"witness {self.name!r}: statement is a comment")
+
+class Certificate:
+    def __init__(self, label):
+        self.label = label; self.witnesses = []
+    def add(self, w): self.witnesses.append(w); return self
+    def emit(self, path=None):
+        if path is None:
+            fd, path = tempfile.mkstemp(suffix=".v", prefix=f"pqv_{self.label}_")
+            os.close(fd)
+        lines = [f"(* CERTIFICATE: {self.label} *)",
+                 "Require Import ZArith.", "Open Scope Z_scope.", ""]
+        for w in self.witnesses:
+            lines.append(f"Theorem {w.name} : {w.statement}.")
+            lines.append("Proof. vm_compute. reflexivity. Qed.")
+            lines.append("")
+        with open(path, "w") as f: f.write("\n".join(lines))
+        return path
+    @staticmethod
+    def check(path, timeout=60.0):
+        if shutil.which("coqc") is None: return False, "coqc not in PATH"
+        try:
+            proc = subprocess.run(["coqc", path], capture_output=True,
+                                  text=True, timeout=timeout)
+            for ext in (".vo", ".glob", ".vok", ".vos"):
+                try: os.remove(path.replace(".v", ext))
+                except FileNotFoundError: pass
+            return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+        except subprocess.TimeoutExpired:
+            return False, f"coqc timeout after {timeout}s"
+    def certificate_hash(self):
+        payload = "|".join(f"{w.name}:{w.statement}" for w in self.witnesses)
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+@dataclass(frozen=True)
+class Attestation:
+    engine_id: str; engine_name: str; binary_hash: str; epoch: int
+    inputs_hash: str; certificate_hash: str; output_hash: str
+    co_signer_id: str; signature: str = ""
+    def payload(self):
+        return (f"{self.engine_id}|{self.engine_name}|{self.binary_hash}|"
+                f"{self.epoch}|{self.inputs_hash}|{self.certificate_hash}|"
+                f"{self.output_hash}|{self.co_signer_id}").encode()
+    def attestation_hash(self):
+        return hashlib.sha256(self.payload()).hexdigest()
+
+class RefusedToSign(Exception): pass
+class ConfigError(Exception): pass
+class DecisionError(Exception): pass
+
+def _hash(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+
+def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs, co_signer_id):
+    return Attestation(engine_id=engine_id, engine_name=engine_name,
+                       binary_hash=binary_hash, epoch=epoch,
+                       inputs_hash=_hash(inputs),
+                       certificate_hash=cert.certificate_hash(),
+                       output_hash=_hash(outputs), co_signer_id=co_signer_id)
+
+class CoSigner:
+    def __init__(self, signer_id, private_key, require_coqc=False):
+        self.id = signer_id; self.private_key = private_key
+        self.require_coqc = require_coqc; self.notes = []
+    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn):
+        self.notes = []
+        if proposal.co_signer_id != self.id:
+            raise RefusedToSign("proposal addressed to a different co-signer")
+        actual_bin = hashlib.sha256(open(binary_path, "rb").read()).hexdigest()
+        if actual_bin != proposal.binary_hash:
+            self.notes.append("binary: MISMATCH")
+            raise RefusedToSign(f"binary mismatch")
+        self.notes.append("binary hash: match")
+        if _hash(inputs) != proposal.inputs_hash:
+            self.notes.append("inputs: MISMATCH")
+            raise RefusedToSign("inputs hash mismatch")
+        self.notes.append("inputs hash: match")
+        recomputed = re_run_fn(inputs)
+        if _hash(recomputed) != proposal.output_hash:
+            self.notes.append("output: MISMATCH")
+            raise RefusedToSign("output mismatch")
+        self.notes.append("re-run output: match")
+        ok, out = Certificate.check(cert_path)
+        if ok:
+            self.notes.append("certificate: coqc PASS")
+        else:
+            if self.require_coqc:
+                self.notes.append("certificate: coqc FAIL")
+                raise RefusedToSign(f"certificate failed coqc")
+            self.notes.append("certificate: coqc unavailable")
+        sig = hmac.new(self.private_key, proposal.payload(), hashlib.sha256).hexdigest()
+        return replace(proposal, signature=sig)
+
+@dataclass(frozen=True)
+class Record:
+    index: int; prev_hash: str; attestation_hash: str
+    audit_head_ref: str; action_digest: str; trajectory_state: tuple
+    trajectory_signature: str; class_id: str; verdict_kind: str
+    guard_id: str; punya_delta: float; vow_hash: str
+    def hash(self):
+        payload = (f"{self.index}|{self.prev_hash}|{self.attestation_hash}|"
+                   f"{self.audit_head_ref}|{self.action_digest}|"
+                   f"{list(self.trajectory_state)}|{self.trajectory_signature}|"
+                   f"{self.class_id}|{self.verdict_kind}|{self.guard_id}|"
+                   f"{self.punya_delta}|{self.vow_hash}")
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+def witness_zq_butterfly(q, a, b, w, ea, eb, idx):
+    we = CoqWitness(name=f"zq_bf_{idx}_even",
+                    statement=f"({a} + {w} * {b}) mod {q} = {ea}",
+                    engine_output={"a": a, "b": b, "w": w, "ea": ea, "q": q},
+                    engine_name=f"libzq/q={q}")
+    wo = CoqWitness(name=f"zq_bf_{idx}_odd",
+                    statement=f"({a} + ({q} - {w}) * {b}) mod {q} = {eb}",
+                    engine_output={"a": a, "b": b, "w": w, "eb": eb, "q": q},
+                    engine_name=f"libzq/q={q}")
+    return we, wo

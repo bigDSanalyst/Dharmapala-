@@ -3,6 +3,7 @@ import hashlib, re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
+from effects import UnknownEffect, require_known
 
 class Op(Enum):
     COMMIT = auto(); FORBID = auto(); BALANCE = auto(); FIELD = auto()
@@ -65,6 +66,10 @@ def parse_vow(source):
         m = _TRAJ_RE.match(line)
         if m:
             name = m.group(1)
+            for pred in filter(None, m.groups()[1:]):
+                if pred.startswith("effect:"):
+                    try: require_known(pred[7:], f"line {lineno}")
+                    except UnknownEffect as e: raise SyntaxError(str(e)) from None
             if m.group(2):
                 vow.clauses.append(TrajectoryClause(name, Pattern.NEVER_AFTER, m.group(2), m.group(3)))
             elif m.group(4):
@@ -76,6 +81,8 @@ def parse_vow(source):
         if not m: raise SyntaxError(f"line {lineno}: {line!r}")
         op = Op[m.group(1).upper()]
         if op in (Op.COMMIT, Op.FORBID):
+            try: require_known(m.group(2), f"line {lineno}")
+            except UnknownEffect as e: raise SyntaxError(str(e)) from None
             vow.clauses.append(Clause(op, m.group(2), m.group(3)))
         elif op == Op.BALANCE:
             vow.clauses.append(Clause(op, m.group(4), m.group(5)))

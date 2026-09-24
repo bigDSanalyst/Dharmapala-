@@ -47,13 +47,24 @@ class Guard:
                 "proven": sum(1 for r in self.ledger.records if r.guard_id == self.id),
                 "refused": self.refusals, "confidence": self.confidence}
     def integrity(self): return self.ledger.verify_integrity()
+    def record_refusal(self, class_id, reason, notes=(), certificate_path="",
+                       attestation_hash="", trajectory_attestation=""):
+        self.ledger.record_audit(AuditEntry(
+            index=len(self.ledger.audits) + self.ledger._audits_offset(),
+            prev_audit_hash=self.ledger.audit_head(),
+            record_head_ref=self.ledger.head_hash(),
+            epoch=len(self.ledger.records),
+            guard_id=self.id, class_id=class_id, reason=reason,
+            co_signer_notes=tuple(notes), certificate_path=certificate_path,
+            attestation_hash=attestation_hash,
+            trajectory_attestation=trajectory_attestation, timestamp=time.time()))
 
     def engage(self, action, vow, co_signer, traj_cosigner, class_id,
                inputs, re_run_fn, binary_path, binary_hash):
         if not class_id:
             return Verdict(VerdictKind.LAWFUL, "routine", action.id, self.id)
         traj_clauses = vow.trajectories()
-        prior_state = (); traj_sig = ""
+        prior_state = (); traj_att = None; traj_ref = ""
         if traj_clauses:
             from trajectory import TrajectoryChecker
             checker = TrajectoryChecker(traj_clauses)
@@ -67,19 +78,15 @@ class Guard:
             if not ok:
                 return Verdict(VerdictKind.FAILURE_REFUSAL,
                                f"trajectory cosigner: {result}", action.id, self.id)
-            traj_sig = result; prior_state = new_state
+            traj_att = result; traj_ref = result.attestation_hash()
+            prior_state = new_state
             if traj_verdict == "LEARNING":
-                audit = AuditEntry(
-                    index=len(self.ledger.audits) + self.ledger._audits_offset(),
-                    prev_audit_hash=self.ledger.audit_head(),
-                    record_head_ref=self.ledger.head_hash(),
-                    epoch=len(self.ledger.records),
-                    guard_id=self.id, class_id=f"traj:{immediate[0]}",
+                self.ledger.store_attestation(traj_att)
+                self.record_refusal(
+                    class_id=f"traj:{immediate[0]}",
                     reason=f"trajectory violation: {immediate}",
-                    co_signer_notes=(f"{traj_cosigner.id}: {result[:16]}",),
-                    certificate_path="", attestation_hash="",
-                    trajectory_signature=traj_sig, timestamp=time.time())
-                self.ledger.record_audit(audit)
+                    notes=(f"{traj_cosigner.id}: {traj_ref[:16]}",),
+                    trajectory_attestation=traj_ref)
                 return Verdict(VerdictKind.LEARNING,
                                f"trajectory violation: {immediate}",
                                action.id, self.id)
@@ -102,18 +109,11 @@ class Guard:
         except DecisionError as e:
             return Verdict(VerdictKind.FAILURE_DECISION, str(e), action.id, self.id)
         except RefusedToSign as e:
-            audit = AuditEntry(
-                index=len(self.ledger.audits) + self.ledger._audits_offset(),
-                prev_audit_hash=self.ledger.audit_head(),
-                record_head_ref=self.ledger.head_hash(),
-                epoch=len(self.ledger.records),
-                guard_id=self.id, class_id=class_id,
-                reason=str(e), co_signer_notes=tuple(co_signer.notes),
-                certificate_path=cert_path, attestation_hash="",
-                trajectory_signature="", timestamp=time.time())
-            self.ledger.record_audit(audit)
+            self.record_refusal(class_id=class_id, reason=str(e),
+                                notes=co_signer.notes, certificate_path=cert_path)
             return Verdict(VerdictKind.FAILURE_REFUSAL, str(e), action.id, self.id)
         self.ledger.store_attestation(signed)
+        if traj_att is not None: self.ledger.store_attestation(traj_att)
         kind = self._classify(action, vow)
         record = Record(
             index=len(self.ledger.records) + self.ledger._records_offset(),
@@ -121,9 +121,9 @@ class Guard:
             attestation_hash=signed.attestation_hash(),
             audit_head_ref=self.ledger.audit_head(),
             action_digest=action.canonical_digest(),
-            trajectory_state=prior_state, trajectory_signature=traj_sig,
+            trajectory_state=prior_state, trajectory_attestation=traj_ref,
             class_id=class_id, verdict_kind=kind.name, guard_id=self.id,
-            punya_delta=self._punya(kind, class_id), vow_hash=vow.hash())
+            punya_delta=self._punya(kind, action), vow_hash=vow.hash())
         self.ledger.append(record)
         return Verdict(kind, f"class {class_id} stressed",
                        action.id, self.id, signed.attestation_hash())
@@ -134,7 +134,10 @@ class Guard:
             if c.op.name == "FORBID" and c.arg1 in effects:
                 return VerdictKind.LEARNING
         return VerdictKind.LAWFUL
-    def _punya(self, kind, class_id):
+    def _punya(self, kind, action):
+        # Merit is for being stressed and holding. An action with no effects
+        # stressed nothing, so it earns nothing, however lawful it is.
+        if not action.effects(): return 0.0
         if kind == VerdictKind.LAWFUL: return 2.0
         if kind == VerdictKind.LEARNING: return 1.0
         return 0.0

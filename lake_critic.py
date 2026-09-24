@@ -5,7 +5,22 @@ if shutil.which('lean') is None:
     elan = pathlib.Path.home() / '.elan' / 'bin'
     if (elan / 'lean').exists():
         os.environ['PATH'] = f"{elan}:" + os.environ.get('PATH', '')
-_LEAN = shutil.which('lean')
+
+def _probe(path):
+    # Finding a file named lean is not the same as being able to run it: an
+    # elan shim with no toolchain downloaded is found on PATH and then fails.
+    if path is None: return None, "no lean on PATH"
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, f"lean at {path} does not run: {e}"
+    if r.returncode != 0:
+        out = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
+        why = next((l for l in out if l.startswith("error")), out[-1] if out else f"exit {r.returncode}")
+        return None, f"lean at {path} does not run: {why.strip()}"
+    return path, r.stdout.strip()
+
+_LEAN, _LEAN_STATUS = _probe(shutil.which('lean'))
 
 def _python_decide(source):
     effects = []
@@ -37,9 +52,14 @@ def check(lean_source, lake_root=None, timeout=15.0):
         return r.returncode == 0, combined.strip() or "lean accepted"
     except subprocess.TimeoutExpired:
         return False, f"lean timed out after {timeout}s"
+    except OSError as e:
+        return False, f"lean found at {_LEAN} but could not run: {e}"
     finally:
         try: os.remove(path)
         except FileNotFoundError: pass
 
 def which_critic():
     return "lean" if _LEAN else "python-degraded"
+
+def critic_status():
+    return _LEAN_STATUS

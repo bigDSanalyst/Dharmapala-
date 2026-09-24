@@ -1,6 +1,6 @@
 
-import hashlib, hmac, json
-from dataclasses import dataclass
+import hashlib, json
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional
 
@@ -56,9 +56,21 @@ class TrajectoryChecker:
                 violations.append(c.name + ":pending")
         return new_state, violations
 
+@dataclass(frozen=True)
+class TrajectoryAttestation:
+    signer_id: str; prior_state: tuple; action_digest: str; verdict: str
+    signature: str = ""
+    def payload(self):
+        return json.dumps({"prior_state": list(self.prior_state),
+                           "action": self.action_digest,
+                           "verdict": self.verdict,
+                           "signer": self.signer_id}, sort_keys=True).encode()
+    def attestation_hash(self):
+        return hashlib.sha256(self.payload()).hexdigest()
+
 class TrajectoryCoSigner:
-    def __init__(self, signer_id, key):
-        self.id = signer_id; self._key = key
+    def __init__(self, signer):
+        self.id = signer.id; self._signer = signer
     def cosign(self, clauses, prior_state, action, guard_verdict):
         checker = TrajectoryChecker(clauses)
         if len(prior_state) != len(checker.automata): prior_state = checker.initial()
@@ -67,7 +79,6 @@ class TrajectoryCoSigner:
         my_verdict = "LEARNING" if immediate else "LAWFUL"
         if my_verdict != guard_verdict:
             return False, f"verdict mismatch: guard={guard_verdict} cosigner={my_verdict}"
-        payload = json.dumps({"prior_state": list(prior_state),
-                              "action": action.canonical_digest(),
-                              "verdict": guard_verdict}, sort_keys=True).encode()
-        return True, hmac.new(self._key, payload, hashlib.sha256).hexdigest()
+        a = TrajectoryAttestation(self.id, tuple(prior_state),
+                                  action.canonical_digest(), guard_verdict)
+        return True, replace(a, signature=self._signer.sign(a.payload()).hex())

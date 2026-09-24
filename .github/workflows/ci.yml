@@ -2,12 +2,27 @@ name: CI
 on: [push, pull_request]
 jobs:
   python:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: sudo apt-get update && sudo apt-get install -y gcc
-      - run: pip install pytest dilithium-py numpy
+      - run: sudo apt-get update && sudo apt-get install -y gcc coq zstd
+      # Lean comes from the release named in lean/lean-toolchain and is checked
+      # against a pinned hash, so bumping the toolchain means updating the hash.
+      - name: Install Lean
+        env:
+          LEAN_SHA256: 320f18e7d58271d95fced740522b5a5ed41b85b2af5bf0e8ab9a8dbc380e450a
+        run: |
+          v=$(sed 's/.*:v//' lean/lean-toolchain)
+          curl -sSfL -o lean.tar.zst "https://github.com/leanprover/lean4/releases/download/v${v}/lean-${v}-linux.tar.zst"
+          echo "${LEAN_SHA256}  lean.tar.zst" | sha256sum -c -
+          mkdir -p "$HOME/lean" && tar --zstd -xf lean.tar.zst -C "$HOME/lean" && rm lean.tar.zst
+          echo "$HOME/lean/lean-${v}-linux/bin" >> "$GITHUB_PATH"
+      - run: pip install -r requirements.txt pytest
       - run: pytest -q
+      # The demo exits 1 unless Lean, Coq and ML-DSA-65 all actually ran, so a
+      # green run here means every layer ran, not just that nothing crashed.
+      - name: Demo passes with every layer running
+        run: python3 run_demo.py

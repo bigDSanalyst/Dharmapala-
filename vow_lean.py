@@ -1,6 +1,5 @@
 
-EFFECT_NAMES = ["read", "write", "exfiltrate", "hoard", "dominate",
-                "destruct", "network_access", "exec", "read_sensitive_path"]
+from effects import EFFECTS as EFFECT_NAMES, require_known
 
 def emit_vow_compliance(effects, vow):
     forbidden = [c.arg1 for c in vow.action_clauses() if c.op.name == "FORBID"]
@@ -13,7 +12,7 @@ def emit_vow_compliance(effects, vow):
     lines.append(f"def proposedEffects : List Effect := [{effects_lean}]")
     lines.append("")
     for f in forbidden:
-        if f not in EFFECT_NAMES: continue
+        require_known(f, f"vow {vow.name}")
         lines.append(f"example : Effect.{f} \u2209 proposedEffects := by decide")
         lines.append("")
     return "\n".join(lines), violations

@@ -27,10 +27,18 @@ class EProcessDrift:
                               drifted=self.log_e > self.threshold,
                               direction="rising" if self.S > 0 else "falling")
 
+def outcomes(ledger):
+    # One observation per engagement, in the order they happened: every audit
+    # entry is a refusal, and a record counts as one when its verdict is
+    # LEARNING. An audit written at epoch k precedes the record appended at k.
+    ev = [(a.epoch, 0, i, True) for i, a in enumerate(ledger.audits)]
+    ev += [(i, 1, i, r.verdict_kind == "LEARNING") for i, r in enumerate(ledger.records)]
+    return [refused for *_, refused in sorted(ev)]
+
 def analyze(ledger, p0=0.15, alpha=0.01):
     ep = EProcessDrift(p0=p0, alpha=alpha)
-    for r in ledger.records:
-        ep.update(r.verdict_kind == "LEARNING")
+    for refused in outcomes(ledger):
+        ep.update(refused)
     return ep.report()
 
 def render(r):

@@ -36,6 +36,6 @@
 - ZK anonymity among witnesses
 - Compilation correctness (Gap 2b)
 - Full-execution certificates (Gap 2c)
-- Observation soundness (the critic proves the Vow against the effects `observation.py` reports, not against what a plan actually does)
+- Observation soundness (the critic proves the Vow against the effects `observation.py` reports, not against what a plan actually does). `tests/test_observation_gaps.py` holds seven exploit shapes it misses today, as strict xfails: the baseline is 0 of 7 caught
 - Refusal binding (a trajectory attestation on an audit entry is signed and checked, but the entry carries no action digest to bind it to)
 - Timestamps (audit entries carry the local clock, which the writer chooses)

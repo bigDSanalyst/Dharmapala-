@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from to_coq_witness import Attestation, Record
 from audit import AuditEntry, verify_audit_chain, GENESIS_HASH as AUDIT_GENESIS
+from trajectory import TrajectoryAttestation
 
 GENESIS_HASH = "0" * 64
 
@@ -18,7 +19,13 @@ class Ledger:
     attestations: dict = field(default_factory=dict)
     audits: list = field(default_factory=list)
     compressions: list = field(default_factory=list)
+    verifiers: dict = field(default_factory=dict)
 
+    def register_verifier(self, v):
+        known = self.verifiers.get(v.id)
+        if known is not None and known.key_id() != v.key_id():
+            raise ValueError(f"signer {v.id!r} already registered under a different key")
+        self.verifiers[v.id] = v
     def store_attestation(self, a):
         self.attestations[a.attestation_hash()] = a
         self._persist()
@@ -40,6 +47,8 @@ class Ledger:
     def audit_head(self):
         return self.audits[-1].hash() if self.audits else AUDIT_GENESIS
     def verify_integrity(self):
+        if self.records and not self._records_offset():
+            if self.records[0].prev_hash != self.genesis_hash: return False
         if self.records:
             for i in range(1, len(self.records)):
                 if self.records[i].prev_hash != self.records[i-1].hash(): return False
@@ -47,10 +56,31 @@ class Ledger:
             for i in range(1, len(self.audits)):
                 if self.audits[i].prev_audit_hash != self.audits[i-1].hash(): return False
         for r in self.records:
-            if r.attestation_hash and r.attestation_hash not in self.attestations:
+            if r.attestation_hash and not isinstance(self.attestations.get(r.attestation_hash), Attestation):
                 return False
+            if not self._trajectory_ok(r.trajectory_attestation, r.action_digest, "LAWFUL"):
+                return False
+        for a in self.audits:
+            if not self._trajectory_ok(a.trajectory_attestation, None, "LEARNING"):
+                return False
+        if not all(self.signature_ok(h, a) for h, a in self.attestations.items()):
+            return False
         if not verify_audit_chain(self.audits): return False
         return True
+    def signature_ok(self, key, a):
+        # An attestation counts only if it is stored under its own hash and
+        # carries a valid signature from a verifier registered for its signer.
+        if key != a.attestation_hash(): return False
+        v = self.verifiers.get(a.signer_id)
+        if v is None or not a.signature: return False
+        try: sig = bytes.fromhex(a.signature)
+        except ValueError: return False
+        return v.verify(a.payload(), sig)
+    def _trajectory_ok(self, ref, action_digest, verdict):
+        if not ref: return True
+        t = self.attestations.get(ref)
+        if not isinstance(t, TrajectoryAttestation) or t.verdict != verdict: return False
+        return action_digest is None or t.action_digest == action_digest
     def _persist(self):
         if self.path is None: return
         with open(self.path, "w") as f:

@@ -1,5 +1,6 @@
 
 import hashlib, hmac
+import merkle
 from dataclasses import dataclass, replace
 
 GENESIS_HASH = "0" * 64
@@ -14,12 +15,4 @@ class CompressionEntry:
     def hash(self): return hashlib.sha256(self.payload()).hexdigest()
 
 def merkle_root(hashes):
-    if not hashes: return GENESIS_HASH
-    layer = list(hashes)
-    while len(layer) > 1:
-        nxt = []
-        for i in range(0, len(layer) - 1, 2):
-            nxt.append(hashlib.sha256((layer[i] + layer[i+1]).encode()).hexdigest())
-        if len(layer) % 2: nxt.append(layer[-1])
-        layer = nxt
-    return layer[0]
+    return merkle.root(list(hashes))

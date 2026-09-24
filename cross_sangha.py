@@ -37,24 +37,47 @@ def publish(ledger, sangha_id, class_id, signer, epoch):
     sig = signer.sign(a.payload())
     return replace(a, signature=sig.hex())
 
-def verify(a, verifier, nullifier_set):
+def verify(a, verifiers):
+    # verifiers maps each sangha_id to that sangha's own verifier. The id in
+    # the attestation is a claim; only the key registered for it can back it.
+    verifier = verifiers.get(a.sangha_id)
+    if verifier is None: return False, f"no verifier registered for sangha {a.sangha_id!r}"
+    if verifier.id != a.sangha_id:
+        return False, f"verifier {verifier.id!r} registered under sangha {a.sangha_id!r}"
     if not a.signature: return False, "missing signature"
     try: sig_bytes = bytes.fromhex(a.signature)
     except ValueError: return False, "signature not hex"
     if not verifier.verify(a.payload(), sig_bytes): return False, "signature invalid"
     if merkle_root(list(a.witness_hashes)) != a.witness_merkle_root:
         return False, "witness_hashes do not match witness_merkle_root"
+    if merkle_root([nullifier_for(h, a.sangha_id) for h in a.witness_hashes]) != a.nullifier_root:
+        return False, "nullifier_root does not match witness_hashes"
     if len(a.witness_hashes) != a.count:
         return False, "count does not match witness_hashes length"
     return True, "ok"
 
-def aggregate(attestations, verifier, nullifier_set):
-    credit = {}; signers = {}; rejected = 0
+def distinct_keys(verifiers):
+    # One key standing behind two sangha ids is one witness counted twice.
+    seen = {}
+    for sid, v in verifiers.items():
+        k = v.key_id()
+        if k in seen: return False, f"sanghas {seen[k]!r} and {sid!r} share one key"
+        seen[k] = sid
+    return True, "ok"
+
+def aggregate(attestations, verifiers, nullifier_set=None):
+    ok, why = distinct_keys(verifiers)
+    if not ok: raise ValueError(why)
+    credit = {}; signers = {}; rejected = 0; replayed = 0
     for a in attestations:
-        ok, _ = verify(a, verifier, nullifier_set)
+        ok, _ = verify(a, verifiers)
         if not ok: rejected += 1; continue
+        nfs = [nullifier_for(w, a.sangha_id) for w in a.witness_hashes]
+        if nullifier_set is not None and not all(nullifier_set.is_new(n) for n in nfs):
+            replayed += 1; continue
         for w in a.witness_hashes:
             credit[w] = 1
             signers.setdefault(w, set()).add(a.sangha_id)
+        if nullifier_set is not None: nullifier_set.absorb(nfs)
     return {"credit": credit, "signers": signers,
-            "n_unique": len(credit), "n_rejected": rejected}
+            "n_unique": len(credit), "n_rejected": rejected, "n_replayed": replayed}

@@ -1,41 +1,11 @@
 
 import hashlib, math
+import merkle
 from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 STRATEGY_SPEC = "highest-pressure-unproven-v1"
 GENESIS_HASH = "0" * 64
-
-def _merkle_root(items):
-    if not items: return GENESIS_HASH
-    layer = [hashlib.sha256(x.encode()).hexdigest() for x in items]
-    while len(layer) > 1:
-        nxt = []
-        for i in range(0, len(layer) - 1, 2):
-            nxt.append(hashlib.sha256((layer[i] + layer[i+1]).encode()).hexdigest())
-        if len(layer) % 2: nxt.append(layer[-1])
-        layer = nxt
-    return layer[0]
-
-def _merkle_path(items, index):
-    layer = [hashlib.sha256(x.encode()).hexdigest() for x in items]
-    path = []; i = index
-    while len(layer) > 1:
-        sib = (layer[i+1] if i+1 < len(layer) else layer[i]) if i % 2 == 0 else layer[i-1]
-        path.append(sib)
-        nxt = []
-        for j in range(0, len(layer) - 1, 2):
-            nxt.append(hashlib.sha256((layer[j] + layer[j+1]).encode()).hexdigest())
-        if len(layer) % 2: nxt.append(layer[-1])
-        layer = nxt; i //= 2
-    return tuple(path)
-
-def _verify_merkle_path(leaf, path, root):
-    h = hashlib.sha256(leaf.encode()).hexdigest()
-    for sib in path:
-        h = hashlib.sha256((h + sib).encode()).hexdigest() if h < sib else hashlib.sha256((sib + h).encode()).hexdigest()
-    return h == root
-
 @dataclass(frozen=True)
 class Class:
     id: str; source_clause: str; pressure: float = 0.0
@@ -65,6 +35,7 @@ class Adversary:
         self._seed_secret = seed_secret
         self._classes = []; self._samplers = {}
         self._committed = False; self.commitment = None
+        self._committed_ids = ()
         self.transcript = []; self._revealed = False
     def register(self, cls, sampler):
         if self._committed: raise RuntimeError("cannot register after commitment")
@@ -72,13 +43,14 @@ class Adversary:
     def commit(self, epoch=0):
         if self._committed: raise RuntimeError("already committed")
         ids = sorted(c.id for c in self._classes)
-        root = _merkle_root(ids)
+        root = merkle.root(ids)
         strategy_hash = hashlib.sha256(STRATEGY_SPEC.encode()).hexdigest()
         c = AdversaryCommitment(epoch=epoch, class_index_root=root,
                                 strategy_hash=strategy_hash, adversary_id=self.id)
         sig = self._signer.sign(c.payload())
         c = replace(c, signature=sig.hex())
         self.commitment = c; self._committed = True
+        self._committed_ids = tuple(ids)
         return c
     def _proven(self, guard):
         return {r.class_id for r in guard.ledger.records
@@ -122,9 +94,10 @@ class Adversary:
         if not self._committed: raise RuntimeError("commit() first")
         cls = self._select(guard, beacon, guard_nonce)
         if cls is None: return None
-        ids = sorted(c.id for c in self._classes)
-        idx = ids.index(cls.id)
-        path = _merkle_path(ids, idx)
+        # Prove membership against the list that was committed, not the
+        # current one: shoshin classes added since would change every path.
+        path = (merkle.path(self._committed_ids, self._committed_ids.index(cls.id))
+                if cls.id in self._committed_ids else ())
         sampler = self._samplers.get(cls.id, lambda seed, cid: {"effects": []})
         mix = hashlib.sha256(self._seed_secret + cls.id.encode() +
                              guard.current_hash.encode() + beacon +
@@ -144,6 +117,7 @@ class Adversary:
     def verify_transcript(self, verifier, strategy_spec=STRATEGY_SPEC):
         if not self._revealed: return False, "index not revealed"
         if self.commitment is None: return False, "no commitment"
+        if verifier.id != self.id: return False, f"verifier is {verifier.id!r}, not {self.id!r}"
         sig_bytes = bytes.fromhex(self.commitment.signature)
         if not verifier.verify(self.commitment.payload(), sig_bytes):
             return False, "signature invalid"
@@ -153,8 +127,8 @@ class Adversary:
             if r.commitment_hash != self.commitment.hash():
                 return False, f"epoch {r.epoch}: commitment hash mismatch"
             if ":shoshin-" not in r.class_id:
-                if not _verify_merkle_path(r.class_id, r.class_path,
-                                           self.commitment.class_index_root):
+                if not merkle.verify(r.class_id, r.class_path,
+                                     self.commitment.class_index_root):
                     return False, f"epoch {r.epoch}: merkle path invalid"
         return True, "ok"
     def curriculum_entropy(self, guard):
@@ -174,7 +148,8 @@ class AdversaryEnsemble:
         return [m.next_engagement(guard, beacon, epoch, guard_nonce=guard_nonce)
                 for m in self.members]
     def reveal_index(self): return [m.reveal_index() for m in self.members]
-    def verify_transcript(self, verifier):
-        return [m.verify_transcript(verifier) for m in self.members]
+    def verify_transcript(self, verifiers):
+        # Each member is checked against its own key, never a shared one.
+        return [m.verify_transcript(verifiers[m.id]) for m in self.members]
     def curriculum_entropy(self, guard):
         return sum(m.curriculum_entropy(guard) for m in self.members)

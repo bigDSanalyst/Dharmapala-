@@ -26,7 +26,7 @@
 ## Beyond the twelve
 - Critic loop — Lean verifies Vow compliance during proposal, not after execution
 - Adversary ensemble — N independent curricula; guard must satisfy all
-- Guard nonce — per-epoch commit-reveal closes selection grinding
+- Guard nonce — per epoch the guard commits, a counterparty contributes randomness after seeing the commitment, then the guard reveals; the guard cannot grind a seed it cannot compute at commit time
 
 ## Not guaranteed
 - Spec equivalence (algorithm identity proved, not binary-implements-spec)
@@ -36,3 +36,6 @@
 - ZK anonymity among witnesses
 - Compilation correctness (Gap 2b)
 - Full-execution certificates (Gap 2c)
+- Observation soundness (the critic proves the Vow against the effects `observation.py` reports, not against what a plan actually does)
+- Refusal binding (a trajectory attestation on an audit entry is signed and checked, but the entry carries no action digest to bind it to)
+- Timestamps (audit entries carry the local clock, which the writer chooses)

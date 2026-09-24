@@ -1,5 +1,5 @@
 
-import hashlib, hmac, json, os, shutil, subprocess, tempfile
+import hashlib, json, os, shutil, subprocess, tempfile
 from dataclasses import dataclass, replace
 
 @dataclass(frozen=True)
@@ -28,7 +28,9 @@ class Certificate:
         return path
     @staticmethod
     def check(path, timeout=60.0):
-        if shutil.which("coqc") is None: return False, "coqc not in PATH"
+        # True: coqc accepted it. False: coqc ran and rejected it (or hung).
+        # None: coqc could not be run, so nothing was checked.
+        if shutil.which("coqc") is None: return None, "coqc not in PATH"
         try:
             proc = subprocess.run(["coqc", path], capture_output=True,
                                   text=True, timeout=timeout)
@@ -38,6 +40,8 @@ class Certificate:
             return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired:
             return False, f"coqc timeout after {timeout}s"
+        except OSError as e:
+            return None, f"coqc found but could not run: {e}"
     def certificate_hash(self):
         payload = "|".join(f"{w.name}:{w.statement}" for w in self.witnesses)
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -46,11 +50,14 @@ class Certificate:
 class Attestation:
     engine_id: str; engine_name: str; binary_hash: str; epoch: int
     inputs_hash: str; certificate_hash: str; output_hash: str
-    co_signer_id: str; signature: str = ""
+    co_signer_id: str; certificate_status: str = ""; signature: str = ""
+    @property
+    def signer_id(self): return self.co_signer_id
     def payload(self):
         return (f"{self.engine_id}|{self.engine_name}|{self.binary_hash}|"
                 f"{self.epoch}|{self.inputs_hash}|{self.certificate_hash}|"
-                f"{self.output_hash}|{self.co_signer_id}").encode()
+                f"{self.output_hash}|{self.co_signer_id}|"
+                f"{self.certificate_status}").encode()
     def attestation_hash(self):
         return hashlib.sha256(self.payload()).hexdigest()
 
@@ -69,8 +76,8 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs, c
                        output_hash=_hash(outputs), co_signer_id=co_signer_id)
 
 class CoSigner:
-    def __init__(self, signer_id, private_key, require_coqc=False):
-        self.id = signer_id; self.private_key = private_key
+    def __init__(self, signer, require_coqc=False):
+        self.id = signer.id; self._signer = signer
         self.require_coqc = require_coqc; self.notes = []
     def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn):
         self.notes = []
@@ -91,26 +98,32 @@ class CoSigner:
             raise RefusedToSign("output mismatch")
         self.notes.append("re-run output: match")
         ok, out = Certificate.check(cert_path)
-        if ok:
-            self.notes.append("certificate: coqc PASS")
-        else:
-            if self.require_coqc:
-                self.notes.append("certificate: coqc FAIL")
-                raise RefusedToSign(f"certificate failed coqc")
+        if ok is None:
             self.notes.append("certificate: coqc unavailable")
-        sig = hmac.new(self.private_key, proposal.payload(), hashlib.sha256).hexdigest()
-        return replace(proposal, signature=sig)
+            if self.require_coqc:
+                raise ConfigError(f"certificate not checked: {out}")
+            status = "coqc-unavailable"
+        elif not ok:
+            self.notes.append("certificate: coqc FAIL")
+            raise RefusedToSign("certificate failed coqc")
+        else:
+            self.notes.append("certificate: coqc PASS")
+            status = "coqc-pass"
+        # The status is signed: an attestation says whether its certificate
+        # was actually checked, and doctor can count the ones that were not.
+        unsigned = replace(proposal, certificate_status=status)
+        return replace(unsigned, signature=self._signer.sign(unsigned.payload()).hex())
 
 @dataclass(frozen=True)
 class Record:
     index: int; prev_hash: str; attestation_hash: str
     audit_head_ref: str; action_digest: str; trajectory_state: tuple
-    trajectory_signature: str; class_id: str; verdict_kind: str
+    trajectory_attestation: str; class_id: str; verdict_kind: str
     guard_id: str; punya_delta: float; vow_hash: str
     def hash(self):
         payload = (f"{self.index}|{self.prev_hash}|{self.attestation_hash}|"
                    f"{self.audit_head_ref}|{self.action_digest}|"
-                   f"{list(self.trajectory_state)}|{self.trajectory_signature}|"
+                   f"{list(self.trajectory_state)}|{self.trajectory_attestation}|"
                    f"{self.class_id}|{self.verdict_kind}|{self.guard_id}|"
                    f"{self.punya_delta}|{self.vow_hash}")
         return hashlib.sha256(payload.encode()).hexdigest()

@@ -4,7 +4,9 @@
 # constructors, and lean/Dharma/Effects.lean declares the same set
 # (tests/test_vocabulary.py fails if any copy drifts).
 EFFECTS = ("read", "write", "exfiltrate", "hoard", "dominate",
-           "destruct", "network_access", "exec", "read_sensitive_path")
+           "destruct", "network_access", "exec", "read_sensitive_path",
+           "read_outside_workdir", "write_outside_workdir", "exec_unvetted",
+           "network_unlisted")
 
 class UnknownEffect(ValueError): pass
 

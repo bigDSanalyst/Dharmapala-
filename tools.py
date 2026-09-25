@@ -8,22 +8,29 @@ class Sandbox:
         self.calls = []
     def _record(self, tool, kwargs, result):
         self.calls.append((tool, kwargs, result))
+    def _resolve(self, path):
+        # An absolute path says where it goes, and observation.py judges it.
+        # A relative path means "in the workdir": one that resolves anywhere
+        # else (../, or a symlink inside the workdir) is refused, not followed.
+        p = pathlib.Path(path)
+        if p.is_absolute(): return p
+        q = (self.workdir / p).resolve()
+        if not q.is_relative_to(self.workdir.resolve()):
+            raise PermissionError(f"{path!r} resolves outside the workdir")
+        return q
     def file_read(self, path):
         kwargs = {"path": str(path)}
         if self.dry_run: r = {"ok": True, "dry_run": True}
         else:
-            p = pathlib.Path(path)
-            if not p.is_absolute(): p = self.workdir / p
-            try: content = p.read_text()[:2000]; r = {"ok": True, "bytes": len(content)}
+            try: content = self._resolve(path).read_text()[:2000]; r = {"ok": True, "bytes": len(content)}
             except Exception as e: r = {"ok": False, "error": str(e)}
         self._record("file_read", kwargs, r); return r
     def file_write(self, path, content):
         kwargs = {"path": str(path), "content": content}
         if self.dry_run: r = {"ok": True, "dry_run": True}
         else:
-            p = pathlib.Path(path)
-            if not p.is_absolute(): p = self.workdir / p
             try:
+                p = self._resolve(path)
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content); r = {"ok": True, "bytes": len(content)}
             except Exception as e: r = {"ok": False, "error": str(e)}

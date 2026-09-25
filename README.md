@@ -1,7 +1,11 @@
 # Dharmapala
 
-A verified agentic guard framework. Every guard decision is a machine-checked
-proof or a hash-bound record; nothing self-declared, nothing trusted.
+A verified agentic guard framework. Every engaged guard decision carries a
+Coq proof of its verdict: the certificate states which forbidden effects the
+action carries, and coqc must accept it. A co-signer reaches its own verdict,
+rebuilds that certificate and checks it itself, then signs the action, verdict
+and Vow it vouches for. Routine actions are judged but not certified. What the
+proofs rest on, and what they do not cover, is in `spec/FRAMEWORK.md`.
 
 Runs end-to-end on Colab. Not audited. Not for production.
 

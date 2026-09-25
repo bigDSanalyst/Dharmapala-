@@ -18,8 +18,10 @@ def signed_traj(signer, action_digest, verdict="LAWFUL"):
     a = TrajectoryAttestation(signer.id, (0,), action_digest, verdict)
     return replace(a, signature=signer.sign(a.payload()).hex())
 
-def signed_att(signer, status="coqc-pass"):
-    a = Attestation("g", "guard", "b", 0, "i", "c", "o", signer.id, status)
+def signed_att(signer, status="coqc-pass", action_digest="d", verdict="LAWFUL", vow_hash="v"):
+    # Bound by default to what record() records: action "d", LAWFUL, vow "v".
+    a = Attestation("g", "guard", "b", 0, "i", "c", "o", signer.id, status,
+                    action_digest=action_digest, vow_hash=vow_hash, verdict=verdict)
     return replace(a, signature=signer.sign(a.payload()).hex())
 
 def record(action_digest="d", traj="", att=""):

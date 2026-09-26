@@ -17,8 +17,8 @@
 #     with a fraud proof that others check without the archive (fraud.py).
 #     That rests on one honest archive holder looking. A validity proof
 #     (folding / IVC) would not; the `proof` slot is reserved for one.
-#   - A checkpoint says nothing about when it was made; its hash() is what to
-#     anchor with an external timestamp.
+#   - A checkpoint says nothing about when it was made. anchoring.py stamps
+#     it in Bitcoin, which proves it existed no later than a block.
 import hashlib, json
 from dataclasses import dataclass, field, replace
 

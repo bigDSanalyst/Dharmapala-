@@ -57,6 +57,33 @@ The default Vow forbids:
 `--vow FILE` replaces it. Credentials come from `ANTHROPIC_API_KEY` or
 `ant auth login`.
 
+### Policy
+
+The Vow says which effects are forbidden. The policy (`policy.py`) says what
+they mean in a given deployment:
+- which paths are sensitive;
+- which commands are vetted;
+- which hosts are allowed, and which are exfiltration sinks;
+- how many writes count as hoarding.
+
+`--policy FILE` sets it:
+
+    python3 guarded_agent.py "..." --workdir DIR --policy policies/strict.json
+
+The built-in default is narrow. It treats only `/etc/passwd`, `/etc/shadow`,
+`/etc/sudoers`, `/root` and `.ssh` as sensitive. `policies/strict.json` adds:
+- `.env` files, and keys and certificates;
+- cloud and container credentials, `.netrc` and git credentials;
+- `/etc/ssh` and `/proc/*/environ`.
+
+Start from it. Every key given in a policy file replaces its default rather
+than adding to it, so a file says everything it means. A file that doesn't
+parse is refused.
+
+Each verdict names the policy that judged it. The run record carries the
+policy, and the attestation signs its hash. The co-signer vouches under exactly
+one policy and refuses a decision made under any other.
+
 ## Verifying a ledger someone gave you
 
     python3 verify.py keys  ledger.json --json > pins.json   # once, when you have reason to trust it

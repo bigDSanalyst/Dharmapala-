@@ -38,6 +38,7 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import jail
+import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
 from decision import forbidden_of
 from guard import Guard, VerdictKind
@@ -104,8 +105,9 @@ class _OneCall:
 
 class Gate:
     """Everything between a proposed tool call and its result."""
-    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner):
+    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner, policy=None):
         self.vow, self.workdir = vow, str(workdir)
+        self.policy = policy_mod.of(policy)      # what the Vow's effects mean here
         self.guard, self.co_signer, self.traj_cosigner = guard, co_signer, traj_cosigner
         pathlib.Path(self.workdir).mkdir(parents=True, exist_ok=True)
         self.jail_ok, self.jail_why = jail.available()
@@ -122,7 +124,7 @@ class Gate:
         if name == "shell" and not self.jail_ok:
             return self._out(name, args, "refused", f"shell is unavailable: no jail ({self.jail_why}); nothing ran")
         # 1. The critic: dry run, and for shell a rehearsal in the jail.
-        critic = CriticLoop(_OneCall(name, args), self.vow, max_retries=1, verbose=False,
+        critic = CriticLoop(_OneCall(name, args), self.vow, max_retries=1, verbose=False, policy=self.policy,
                             guard=self.guard, rehearse=(name == "shell"))
         predicted, ok, plan = critic.propose_and_verify(f"tool:{name}", workdir=self.workdir)
         if not ok:
@@ -137,11 +139,11 @@ class Gate:
         finally: self.co_signer.release(snap)
 
     def _run(self, call_id, name, args, plan, predicted, snap):
-        observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok)
+        observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok, policy=self.policy)
         # 3. The guard judges what ran; the co-signer checks the guard.
         action = Action(id=call_id, verb=name, domain="action")
         action._observed_effects = observed
-        action._evidence = evidence_of(calls, self.workdir, predicted)
+        action._evidence = evidence_of(calls, self.workdir, predicted, self.policy)
         action._snapshot = snap
         verdict = self.guard.engage(action, self.vow, self.co_signer, self.traj_cosigner,
                                     f"tool:{name}", {"tool_use_id": call_id}, _engine,
@@ -204,12 +206,16 @@ class GuardedAgent:
             self.messages.append({"role": "user", "content": results})
         return False, f"stopped after {self.max_turns} turns"
 
-def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None):
+def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None):
+    """The gate and its ledger. The co-signer vouches under the same policy
+    the gate judges by: a gate given another policy would be refused."""
+    policy = policy_mod.of(policy)
     ledger = Ledger(sangha_id="agent", path=ledger_path)
     guard = Guard("Guard", ledger)
     s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
     for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
-    gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co, reexecute=True), TrajectoryCoSigner(s_tr))
+    gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co, reexecute=True, policy=policy),
+                TrajectoryCoSigner(s_tr), policy=policy)
     return gate, ledger
 
 def main(argv=None):
@@ -217,6 +223,8 @@ def main(argv=None):
     ap.add_argument("task")
     ap.add_argument("--workdir", default=None, help="default: a new temporary directory")
     ap.add_argument("--vow", type=pathlib.Path, help="a Vow file (default: the guarded-agent Vow)")
+    ap.add_argument("--policy", type=pathlib.Path,
+                    help="a policy file (policy.py): sensitive paths, vetted commands, hosts")
     ap.add_argument("--ledger", help="write the ledger here")
     ap.add_argument("--max-turns", type=int, default=20)
     ap.add_argument("--model", default=MODEL)
@@ -226,7 +234,10 @@ def main(argv=None):
     except ImportError:
         print("the anthropic package is not installed (pip install anthropic)", file=sys.stderr); return 1
     workdir = args.workdir or tempfile.mkdtemp(prefix="guarded_")
-    gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger)
+    try: pol = policy_mod.Policy.load(args.policy) if args.policy else policy_mod.DEFAULT
+    except policy_mod.PolicyError as e:
+        print(f"policy: {e}", file=sys.stderr); return 1
+    gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol)
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
     try:
@@ -249,7 +260,7 @@ def main(argv=None):
         print(f"  {outcome:16s} {name} {json.dumps(a)[:100]}")
     print(text)
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
-          + f"  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")
+          + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")
     if not finished: print(f"did not finish: {text}", file=sys.stderr)
     return 0 if finished else 1
 

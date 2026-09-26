@@ -84,6 +84,15 @@ Each verdict names the policy that judged it. The run record carries the
 policy, and the attestation signs its hash. The co-signer vouches under exactly
 one policy and refuses a decision made under any other.
 
+## Is the jail really containing anything?
+
+    python3 containment_mutants.py
+
+This breaks the jail one bubblewrap flag at a time and checks that a
+containment probe catches each break as an escape. It exits 0 only when
+every break is caught, and it names each flag no probe here can observe, with
+the reason. CI runs it as an unprivileged user and as root.
+
 ## Verifying a ledger someone gave you
 
     python3 verify.py keys  ledger.json --json > pins.json   # once, when you have reason to trust it

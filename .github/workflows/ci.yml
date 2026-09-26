@@ -33,3 +33,22 @@ jobs:
       # ran, so a green run here means every layer ran, not just that nothing crashed.
       - name: Demo passes with every layer running
         run: python3 run_demo.py
+  # Break the jail one bubblewrap flag at a time and check a containment probe
+  # catches each break (containment_mutants.py). The probes only touch what
+  # the test owns, so a broken jail here does no harm; it runs on a throwaway
+  # runner anyway. Twice: unprivileged, as the jail normally runs, and as
+  # root, where --cap-drop is what keeps the jail's capabilities from it.
+  containment:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap strace
+      - run: pip install pytest
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Every containment mutant caught (unprivileged)
+        run: python3 containment_mutants.py
+      - name: Every containment mutant caught (as root)
+        run: sudo env "PATH=$PATH" python3 containment_mutants.py

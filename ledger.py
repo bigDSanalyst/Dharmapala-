@@ -19,6 +19,7 @@ class Ledger:
     attestations: dict = field(default_factory=dict)
     audits: list = field(default_factory=list)
     checkpoints: list = field(default_factory=list)   # compression.Checkpoint, oldest first
+    disputes: list = field(default_factory=list)      # (checkpoint index, fraud.FraudProof)
     verifiers: dict = field(default_factory=dict)
 
     def register_verifier(self, v):
@@ -61,8 +62,25 @@ class Ledger:
         if self.records: return self.records[-1].trajectory_state
         t = self.carried()["trajectory_state"]
         return tuple(t) if t is not None else ()
+    def dispute(self, index, proof):
+        """Convict checkpoint `index` with a fraud proof. Checked here, needing
+        no archive; a proof that does not verify is refused, not recorded."""
+        from fraud import verify_fraud
+        if not 0 <= index < len(self.checkpoints): raise IndexError(f"no checkpoint {index}")
+        ok, why = verify_fraud(proof, self.checkpoints[index], self.prev_summary(index))
+        if not ok: raise ValueError(f"fraud proof refused: {why}")
+        self.disputes.append((index, proof)); self._persist()
+        return why
+    def prev_summary(self, index):
+        return self.checkpoints[index - 1].summary if index > 0 else None
+    def convicted(self):
+        from fraud import verify_fraud
+        return sorted({i for i, p in self.disputes
+                       if i < len(self.checkpoints)
+                       and verify_fraud(p, self.checkpoints[i], self.prev_summary(i))[0]})
     def verify_integrity(self):
         if not self._checkpoints_ok(): return False
+        if self.convicted(): return False           # a checkpoint shown wrong carries nothing
         start = self.checkpoints[-1].record_head if self.checkpoints else self.genesis_hash
         for i, r in enumerate(self.records):
             if r.index != self._records_offset() + i: return False

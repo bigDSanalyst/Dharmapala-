@@ -19,6 +19,10 @@ def observe(ledger):
                                 "verify_integrity() returned False",
                                 "a chain link, stored attestation or signature does not verify; "
                                 "do not trust this ledger until it is found"))
+    for i in (ledger.convicted() if hasattr(ledger, "convicted") else []):
+        findings.append(Finding("BLOCK", "checkpoint_convicted",
+                                f"checkpoint {i} ({ledger.checkpoints[i].hash()[:16]}) is shown wrong by a fraud proof",
+                                "its carried state cannot be trusted; rebuild from the archive with verify_archive"))
     if ledger.audits:
         findings.append(Finding("LOOK", "refusals_present",
                                 f"{len(ledger.audits)} refusals recorded"))

@@ -50,3 +50,13 @@ class _NullSigner:
 class _Guard:
     id = "G"; current_hash = "0" * 64
     class ledger: records = []; audits = []
+
+@pytest.mark.parametrize("n", range(2, 20))
+def test_a_proof_pins_its_position_not_only_membership(n):
+    """verify_at must refuse a real leaf's real path presented as another index."""
+    items = [f"x{i}" for i in range(n)]; root = merkle.root(items)
+    for j in range(n):
+        p = merkle.path(items, j)
+        assert merkle.verify_at(items[j], p, root, n, j)
+        for i in range(n):
+            if i != j: assert not merkle.verify_at(items[j], p, root, n, i), (n, j, i)

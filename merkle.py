@@ -42,3 +42,19 @@ def verify(item, proof, expected_root):
         elif side == "R": h = node_hash(h, sib)
         else: return False
     return h == expected_root
+
+def sides(size, index):
+    """The L/R pattern of the proof for leaf `index` in a tree of `size`
+    leaves. Distinct indices give distinct patterns, so checking a proof's
+    sides against this pins which position it proves, not only membership."""
+    out = []
+    while size > 1:
+        sib = index ^ 1
+        if sib < size: out.append("L" if sib < index else "R")
+        index //= 2; size = size // 2 + size % 2
+    return out
+
+def verify_at(item, proof, expected_root, size, index):
+    if not 0 <= index < size: return False
+    if [s for _, s in proof] != sides(size, index): return False
+    return verify(item, proof, expected_root)

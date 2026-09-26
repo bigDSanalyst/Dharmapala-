@@ -113,10 +113,23 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
                        evidence_digest=decision.evidence_digest if decision else "")
 
 class CoSigner:
-    def __init__(self, signer, require_coqc=False):
+    def __init__(self, signer, require_coqc=False, reexecute=False):
+        # reexecute: a jailed run is not taken on its trace's word. The
+        # co-signer snapshots the workdir before the run and runs the plan
+        # again itself against that snapshot (replay.py).
         self.id = signer.id; self._signer = signer
-        self.require_coqc = require_coqc; self.notes = []
-    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None):
+        self.require_coqc = require_coqc; self.reexecute = reexecute; self.notes = []
+        self._snapshots = set()
+    def snapshot(self, workdir):
+        """Copy the workdir before the run: what a replay will start from."""
+        import replay
+        snap = replay.take(workdir); self._snapshots.add(snap)
+        return snap
+    def release(self, snap):
+        import replay
+        if snap is not None: self._snapshots.discard(snap); replay.release(snap)
+    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None,
+               snapshot=None):
         self.notes = []
         if proposal.co_signer_id != self.id:
             raise RefusedToSign("proposal addressed to a different co-signer")
@@ -163,6 +176,10 @@ class CoSigner:
                     self.notes.append("effects: MISMATCH")
                     raise RefusedToSign(f"co-signer observed {list(seen)} where the guard reports {list(decision.effects)}")
                 self.notes.append("effects: re-derived, match")
+                jailed = any(t == "shell" and isinstance(r, dict) and r.get("jailed")
+                             for t, _, r in evidence["calls"])
+                if self.reexecute and jailed:
+                    self._replay(evidence, snapshot, decision)
         elif proposal.verdict or proposal.action_digest:
             raise RefusedToSign("proposal carries a decision the co-signer was not shown")
         # Check the certificate this co-signer builds, not the file it was
@@ -191,6 +208,24 @@ class CoSigner:
         # was actually checked, and doctor can count the ones that were not.
         unsigned = replace(proposal, certificate_status=status)
         return replace(unsigned, signature=self._signer.sign(unsigned.payload()).hex())
+
+    def _replay(self, evidence, snapshot, decision):
+        """Run the plan again, from the co-signer's own snapshot of the
+        workdir, and refuse unless it does what the record says it did."""
+        import replay
+        if snapshot is None or snapshot not in self._snapshots:
+            self.notes.append("re-execution: NO SNAPSHOT")
+            raise RefusedToSign("co-signer has no snapshot of its own to re-execute the run against")
+        try: again = tuple(sorted(replay.replay(evidence, snapshot)))
+        except replay.Unreplayable as e:
+            self.notes.append("re-execution: FAILED")
+            raise RefusedToSign(f"co-signer could not re-execute the run: {e}")
+        finally: self.release(snapshot)
+        if again != decision.effects:
+            self.notes.append("re-execution: MISMATCH")
+            raise RefusedToSign(f"re-executed, the co-signer observed {list(again)} where the record "
+                                f"shows {list(decision.effects)}")
+        self.notes.append("re-execution: match")
 
 @dataclass(frozen=True)
 class Record:

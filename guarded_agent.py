@@ -15,9 +15,11 @@ proposes goes through the same gate:
                    traced; file tools in-process, confined to the workdir
                    unless the Vow allows otherwise; http_get never reaches
                    the network (the sandbox has none to give).
-    3. guard       the guard judges what really ran, the co-signer re-derives
-                   it from the run record with its own trace parser, and the
-                   decision goes into the ledger, proven and signed.
+    3. guard       the guard judges what really ran; the co-signer re-derives
+                   it from the run record with its own trace parser, runs a
+                   shell call again itself from its own snapshot of the
+                   workdir, and the decision goes into the ledger, proven and
+                   signed.
     4. result      Claude sees the output only when the verdict is LAWFUL. A
                    call whose real run broke the Vow ran contained, but its
                    output is withheld: what it read is exactly what must not
@@ -129,12 +131,18 @@ class Gate:
                 return self._out(name, args, "refused", f"the critic could not check this call ({last['unchecked']}); nothing ran")
             return self._out(name, args, "refused",
                              f"refused before running: it would have effects the policy forbids: {', '.join(last.get('violations') or ['(unnamed)'])}")
-        # 2. Run it for real.
+        # 2. Run it for real, after the co-signer has copied the workdir for itself.
+        snap = self.co_signer.snapshot(self.workdir) if name == "shell" and self.co_signer.reexecute else None
+        try: return self._run(call_id, name, args, plan, predicted, snap)
+        finally: self.co_signer.release(snap)
+
+    def _run(self, call_id, name, args, plan, predicted, snap):
         observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok)
         # 3. The guard judges what ran; the co-signer checks the guard.
         action = Action(id=call_id, verb=name, domain="action")
         action._observed_effects = observed
         action._evidence = evidence_of(calls, self.workdir, predicted)
+        action._snapshot = snap
         verdict = self.guard.engage(action, self.vow, self.co_signer, self.traj_cosigner,
                                     f"tool:{name}", {"tool_use_id": call_id}, _engine,
                                     self.binary_path, self.binary_hash)
@@ -201,7 +209,7 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None):
     guard = Guard("Guard", ledger)
     s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
     for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
-    gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co), TrajectoryCoSigner(s_tr))
+    gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co, reexecute=True), TrajectoryCoSigner(s_tr))
     return gate, ledger
 
 def main(argv=None):

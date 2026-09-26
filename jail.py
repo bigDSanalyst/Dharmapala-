@@ -68,9 +68,13 @@ def available():
         return False, f"jail probe failed: {e}"
     return True, ""
 
-def _bwrap(workdir):
+def _bwrap(workdir, source=None):
+    # source: mount this directory at the workdir's path instead (a co-signer
+    # replaying a run against its own snapshot, where the command sees the
+    # same paths it saw the first time)
     w = os.path.realpath(workdir)
-    return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", w, w, "--chdir", w,
+    s = os.path.realpath(source) if source else w
+    return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", s, w, "--chdir", w,
             "--dev", "/dev", "--proc", "/proc", "--unshare-all", "--die-with-parent",
             "--new-session", "--cap-drop", "ALL",
             # A clean environment: the host's may hold tokens, and its loader

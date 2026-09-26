@@ -117,7 +117,8 @@ class Guard:
         try:
             signed = co_signer.cosign(proposal, cert_path, inputs, binary_path,
                                       re_run_fn, decision=decision,
-                                      evidence=getattr(action, "_evidence", None))
+                                      evidence=getattr(action, "_evidence", None),
+                                      snapshot=getattr(action, "_snapshot", None))
         except ConfigError as e:
             return Verdict(VerdictKind.FAILURE_CONFIG, str(e), action.id, self.id)
         except DecisionError as e:

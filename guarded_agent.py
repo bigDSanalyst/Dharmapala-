@@ -45,7 +45,7 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import backends, jail
+import backends, jail, runs
 import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
 from decision import forbidden_of
@@ -112,7 +112,7 @@ class _OneCall:
 
 class Gate:
     """Everything between a proposed tool call and its result."""
-    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner, policy=None):
+    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner, policy=None, runs_log=None):
         self.vow, self.workdir = vow, str(workdir)
         self.policy = policy_mod.of(policy)      # what the Vow's effects mean here
         self.guard, self.co_signer, self.traj_cosigner = guard, co_signer, traj_cosigner
@@ -122,14 +122,15 @@ class Gate:
         self.binary_path = str(me)                   # the code that judges is the engine
         self.binary_hash = hashlib.sha256(me.read_bytes()).hexdigest()
         self.log = []                                # (tool, args, outcome, detail)
+        self.runs = runs_log if runs_log is not None else runs.RunLog()   # what really happened (runs.py)
 
     def run(self, call_id, name, args):
         """(content, is_error) for the tool_result."""
         if name not in ARGS or not isinstance(args, dict) or set(args) != ARGS[name] \
                 or not all(isinstance(v, str) for v in args.values()):
-            return self._out(name, args, "invalid", f"not a valid call to a known tool: {name}")
+            return self._out(call_id, name, args, "invalid", f"not a valid call to a known tool: {name}")
         if name == "shell" and not self.jail_ok:
-            return self._out(name, args, "refused", f"shell is unavailable: no jail ({self.jail_why}); nothing ran")
+            return self._out(call_id, name, args, "refused", f"shell is unavailable: no jail ({self.jail_why}); nothing ran")
         # 1. The critic: dry run, and for shell a rehearsal in the jail.
         critic = CriticLoop(_OneCall(name, args), self.vow, max_retries=1, verbose=False, policy=self.policy,
                             guard=self.guard, rehearse=(name == "shell"))
@@ -137,8 +138,8 @@ class Gate:
         if not ok:
             last = critic.attempts[-1] if critic.attempts else {}
             if last.get("unchecked"):
-                return self._out(name, args, "refused", f"the critic could not check this call ({last['unchecked']}); nothing ran")
-            return self._out(name, args, "refused",
+                return self._out(call_id, name, args, "refused", f"the critic could not check this call ({last['unchecked']}); nothing ran")
+            return self._out(call_id, name, args, "refused",
                              f"refused before running: it would have effects the policy forbids: {', '.join(last.get('violations') or ['(unnamed)'])}")
         # 2. Run it for real, after the co-signer has copied the workdir for itself.
         snap = self.co_signer.snapshot(self.workdir) if name == "shell" and self.co_signer.reexecute else None
@@ -159,13 +160,16 @@ class Gate:
         if verdict.kind != VerdictKind.LAWFUL:
             hit = sorted(set(observed) & set(forbidden_of(self.vow)))
             why = f"the run showed {', '.join(hit)}, which the policy forbids" if hit else verdict.reason
-            return self._out(name, args, verdict.kind.name.lower(),
+            return self._out(call_id, name, args, verdict.kind.name.lower(),
                              f"the call ran inside the sandbox, but the guard's verdict is "
-                             f"{verdict.kind.name}: {why}. Its output is withheld.")
-        return self._out(name, args, "lawful", _render(name, calls[-1][2]), error=False)
+                             f"{verdict.kind.name}: {why}. Its output is withheld.",
+                             evidence=action._evidence, withheld=True)
+        return self._out(call_id, name, args, "lawful", _render(name, calls[-1][2]), error=False,
+                         evidence=action._evidence)
 
-    def _out(self, name, args, outcome, detail, error=True):
+    def _out(self, call_id, name, args, outcome, detail, error=True, evidence=None, withheld=False):
         self.log.append((name, args, outcome, detail))
+        self.runs.add(call_id, name, args, outcome, detail, evidence, withheld)
         return detail, error
 
 def _render(name, result):
@@ -200,7 +204,7 @@ class GuardedAgent:
             self.backend.reply([(i, *self.gate.run(i, name, args)) for i, name, args in turn.calls])
         return False, f"stopped after {self.max_turns} turns"
 
-def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None):
+def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_path=None):
     """The gate and its ledger. The co-signer vouches under the same policy
     the gate judges by: a gate given another policy would be refused."""
     policy = policy_mod.of(policy)
@@ -209,7 +213,7 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None):
     s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
     for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
     gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co, reexecute=True, policy=policy),
-                TrajectoryCoSigner(s_tr), policy=policy)
+                TrajectoryCoSigner(s_tr), policy=policy, runs_log=runs.RunLog(runs_path))
     return gate, ledger
 
 def main(argv=None):
@@ -220,6 +224,8 @@ def main(argv=None):
     ap.add_argument("--policy", type=pathlib.Path,
                     help="a policy file (policy.py): sensitive paths, vetted commands, hosts")
     ap.add_argument("--ledger", help="write the ledger here")
+    ap.add_argument("--runs", help="write the run records here (default: next to the ledger, "
+                                   "LEDGER.runs.jsonl; without a ledger, kept in memory)")
     ap.add_argument("--max-turns", type=int, default=20)
     ap.add_argument("--backend", choices=["anthropic", "openai-compatible"], default="anthropic")
     ap.add_argument("--model", help=f"default {MODEL} for anthropic; required for openai-compatible")
@@ -239,7 +245,8 @@ def main(argv=None):
     try: pol = policy_mod.Policy.load(args.policy) if args.policy else policy_mod.DEFAULT
     except policy_mod.PolicyError as e:
         print(f"policy: {e}", file=sys.stderr); return 1
-    gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol)
+    runs_path = args.runs or (args.ledger + ".runs.jsonl" if args.ledger else None)
+    gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path)
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
     if args.backend == "openai-compatible":
@@ -271,7 +278,11 @@ def _report(gate, ledger, pol, workdir, args, finished, text):
     for name, a, outcome, detail in gate.log:
         print(f"  {outcome:16s} {name} {json.dumps(a)[:100]}")
     print(text)
+    # The model's answer is its own claim. Beside it, what the record shows.
+    print("\nwhat actually happened (from the run record, not the model):")
+    for line in runs.account(gate.runs.entries) or ["(no calls)"]: print("  " + line)
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
+          + (f"  runs: {gate.runs.path}" if gate.runs.path else "")
           + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")
     if not finished: print(f"did not finish: {text}", file=sys.stderr)
     return 0 if finished else 1

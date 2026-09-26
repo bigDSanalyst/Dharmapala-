@@ -33,6 +33,10 @@ NETWORK_COMMANDS = {"curl", "wget", "nc", "ncat", "netcat", "ssh", "scp", "sftp"
                     "rsync", "ftp", "telnet", "nmap", "ping"}
 PACKAGE_COMMANDS = {"pip", "pip3", "npm", "apt", "apt-get", "go", "cargo", "gem"}
 SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
+# Devices that swallow or supply bytes and reach nothing else: `2>/dev/null`
+# is not a write outside the workdir.
+HARMLESS_DEVICES = {"/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
+                    "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/tty"}
 REDIRECTS = {">", ">>", "<", ">&", "&>"}
 
 def normalise(path, workdir):
@@ -62,6 +66,7 @@ def _touch_host(target, effects):
 def _touch_path(path, workdir, effects, write):
     p = normalise(path, workdir)
     effects.add("write" if write else "read")
+    if p in HARMLESS_DEVICES: return
     if not inside(p, workdir):
         effects.add("write_outside_workdir" if write else "read_outside_workdir")
     if not write and SENSITIVE_PATHS.search(p):
@@ -130,5 +135,9 @@ def observe(tool_calls, workdir):
             _touch_host(args.get("url", ""), effects)
         elif tool == "shell":
             _observe_shell(str(args.get("cmd", "")), workdir, effects)
+            if isinstance(result, dict) and result.get("jailed"):
+                # It really ran: add what the trace shows it did (jail.py).
+                from jail import effects_of
+                effects |= effects_of(result.get("events", []), workdir)
     if writes >= HOARD_THRESHOLD: effects.add("hoard")
     return effects

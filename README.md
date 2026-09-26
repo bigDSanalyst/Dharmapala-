@@ -22,8 +22,9 @@ and exits 1: a layer that did not run is not a layer that passed.
 | Lean critic | `lean` on PATH, version in `lean/lean-toolchain` | the critic falls back to a Python check |
 | Coq certificates | `coqc` (`apt install coq`) | attestations are signed as `coqc-unavailable` |
 | ML-DSA-65 signatures | `pip install dilithium-py` | signers fall back to HMAC, which anyone able to verify can forge |
+| Jail (real execution, traced) | `bwrap` and `strace` (`apt install bubblewrap strace`) | shell commands are recorded and never run |
 
-CI installs all three, so a green CI run means all three ran.
+CI installs all four, so a green CI run means all four ran.
 
 ## Verifying a ledger someone gave you
 

@@ -9,6 +9,8 @@ class Agent:
             for i in range(4): self.sandbox.file_write(f"stash_{i}.txt", "x" * 100)
         elif "dominate" in p and "do not" not in p:
             self.sandbox.shell("kill -9 -1")
+        elif "list" in p:
+            self.sandbox.shell("ls -la")
         elif "read" in p:
             self.sandbox.file_read("/etc/hostname")
         elif "write" in p:

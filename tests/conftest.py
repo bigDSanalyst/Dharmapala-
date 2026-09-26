@@ -15,6 +15,9 @@ def without(monkeypatch):
         elif name == "coqc":
             monkeypatch.setattr(shutil, "which",
                                 lambda n, *a, **k: None if n == "coqc" else real_which(n, *a, **k))
+        elif name == "jail":
+            import jail
+            monkeypatch.setattr(jail, "available", lambda: (False, "removed by test"))
         elif name == "dilithium-py":
             monkeypatch.setitem(sys.modules, "dilithium_py", None)
             monkeypatch.setitem(sys.modules, "dilithium_py.ml_dsa", None)

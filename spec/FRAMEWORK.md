@@ -16,7 +16,7 @@
 4.  Co-signer re-run (runtime binding): re-runs the engine, reaches its own verdict, rebuilds the certificate and runs coqc on what it built, never on the file it was handed; signs the action digest, verdict and Vow hash
 5.  Record chain: a record may cite only an attestation for its own action, verdict and Vow, and only once
 6.  Audit chain (mutual anchoring)
-7.  Compression (Landauer-correct)
+7.  Compression, commit-before-erase (`compression.py`): before erasing old records and audits, a signed checkpoint commits to each chain (Merkle root and head) and carries forward all the state the guard still reads (merit, proven classes, refusal counts, drift history, trajectory state). The erased entries go to an archive that `verify_archive` checks against the checkpoint by recomputing everything. Lossless by design: a learned or lossy summary could not be checked against what it replaced
 8.  Adversary commitment (ML-DSA-65 / HMAC + Merkle)
 9.  Trajectory DFA (co-signed verdict)
 10. Cross-Sangha attestation (strict witness dedupe)
@@ -42,4 +42,6 @@
   - behaviour that differs between the dry run and the real run
   - the guard and co-signer share one observed effect set: the co-signer's verdict is independent, but its observation is not
 - Routine actions (no class) are judged and refused when they carry a forbidden effect, but they get no certificate
-- Timestamps (audit entries carry the local clock, which the writer chooses)
+- Timestamps (audit entries carry the local clock, which the writer chooses). A checkpoint's `hash()` is the natural thing to anchor externally; nothing anchors it yet
+- Compression summaries are signed, not proven: until someone runs `verify_archive` on the archive, trusting a checkpoint's carried state means trusting the compressor's key. A succinct recursive proof (folding / IVC) that every erased entry verified would remove that trust; `Checkpoint.proof` is reserved for one
+- Cross-Sangha publication reads live records: publish a class's witnesses before compressing them away

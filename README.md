@@ -9,7 +9,7 @@ proofs rest on, and what they do not cover, is in `spec/FRAMEWORK.md`.
 
 Runs end-to-end on Colab. Not audited. Not for production.
 
-    python3 run_demo.py      # 12 layers, critic loop, ensemble
+    python3 run_demo.py      # 12 layers, critic loop, ensemble, compression
     pytest -q
 
 The demo prints `ALL CHECKS PASS` and exits 0 only when every layer actually

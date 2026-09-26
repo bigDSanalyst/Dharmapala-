@@ -16,6 +16,7 @@ from critic_loop import CriticLoop
 from agent import Agent
 from vrf import GuardNonce, Counterparty
 from lake_critic import which_critic, critic_status
+from compression import compress, verify_archive
 
 VOW_SOURCE = """
 vow Dharma
@@ -102,12 +103,25 @@ def main():
         verdicts[epoch] = verdict.kind.name
         print(f"    verdict: {verdict.kind.name}")
 
+    # Layer 7: erase everything recorded so far, keeping a signed checkpoint.
+    # Lossless or it fails: the archive must verify and nothing the guard
+    # reports may change.
+    s_cmp = default_signer("Compressor"); ledger.register_verifier(verifier_for(s_cmp))
+    report_before = guard.report
+    size_before = os.path.getsize(ledger.path)
+    cp, archive = compress(ledger, ledger.next_record_index(), s_cmp)
+    archive_ok, archive_why = verify_archive(archive, cp, verifiers=ledger.verifiers)
+    print(f"\n  [compression] {len(archive.records)} records, {len(archive.audits)} audits, "
+          f"{len(archive.attestations)} attestations -> checkpoint {cp.hash()[:16]}...; "
+          f"ledger file {size_before} -> {os.path.getsize(ledger.path)} bytes; archive: {archive_why}")
+
     ensemble.reveal_index()
     transcripts = ensemble.verify_transcript(
         {s.id: verifier_for(s) for s in (signer_a, signer_b)})
     forbidden = {c.arg1 for c in vow.action_clauses() if c.op.name == "FORBID"}
-    certs = [a.certificate_status for a in ledger.attestations.values()
-             if hasattr(a, "certificate_status")]
+    # Compression moved erased attestations to the archive; they still ran.
+    certs = [a.certificate_status for a in list(ledger.attestations.values()) +
+             list(archive.attestations.values()) if hasattr(a, "certificate_status")]
 
     # A layer that did not run is not a layer that passed. Each entry names
     # what was checked, whether it really ran, and what to install if not.
@@ -117,13 +131,15 @@ def main():
         ("coq certificates", bool(certs) and all(c == "coqc-pass" for c in certs),
          "apt install coq"),
         ("ml-dsa-65 signatures",
-         all(x.scheme == "ml-dsa-65" for x in (s_beta, s_tb, signer_a, signer_b)),
+         all(x.scheme == "ml-dsa-65" for x in (s_beta, s_tb, signer_a, signer_b, s_cmp)),
          "pip install dilithium-py"),
     ]
     checks = [
         ("ledger chains and signatures verify", guard.integrity() and ledger.verify_integrity()),
         ("adversary transcripts verify", all(ok for ok, _ in transcripts)),
         ("no forbidden effect was executed", not any(e & forbidden for e in executed)),
+        ("compression is lossless (archive verifies, report unchanged)",
+         archive_ok and guard.report == report_before),
     ]
 
     print("\n" + "=" * 68)

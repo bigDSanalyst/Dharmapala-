@@ -31,9 +31,13 @@ def outcomes(ledger):
     # One observation per engagement, in the order they happened: every audit
     # entry is a refusal, and a record counts as one when its verdict is
     # LEARNING. An audit written at epoch k precedes the record appended at k.
+    # Engagements erased by compression come first, as the checkpoint carried
+    # them: a drift monitor that restarted at every checkpoint would get a
+    # fresh chance to cross its threshold each time.
+    carried = [c == "1" for c in ledger.carried()["outcomes"]] if hasattr(ledger, "carried") else []
     ev = [(a.epoch, 0, i, True) for i, a in enumerate(ledger.audits)]
-    ev += [(i, 1, i, r.verdict_kind == "LEARNING") for i, r in enumerate(ledger.records)]
-    return [refused for *_, refused in sorted(ev)]
+    ev += [(r.index, 1, i, r.verdict_kind == "LEARNING") for i, r in enumerate(ledger.records)]
+    return carried + [refused for *_, refused in sorted(ev)]
 
 def analyze(ledger, p0=0.15, alpha=0.01):
     ep = EProcessDrift(p0=p0, alpha=alpha)

@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""A real agent, guarded: Claude proposes tool calls, Dharmapala decides.
+"""A real agent, guarded: a model proposes tool calls, Dharmapala decides.
 
     python3 guarded_agent.py "tidy up the notes in this directory" --workdir DIR
-                             [--vow VOW.txt] [--ledger LEDGER.json] [--max-turns N]
+                             [--vow VOW.txt] [--policy POLICY.json] [--ledger LEDGER.json]
+                             [--max-turns N]
+    # a model on your own hardware (vLLM, Ollama, llama.cpp's server, LM Studio):
+    python3 guarded_agent.py "..." --backend openai-compatible
+                             --base-url http://localhost:8000/v1 --model NAME
 
-Claude (through the Anthropic API) sees four tools: shell, file_read,
-file_write, http_get. It never executes anything itself. Every call it
-proposes goes through the same gate:
+The model (Claude through the Anthropic API by default, or any server that
+speaks OpenAI-style chat completions with tools; backends.py) sees four tools:
+shell, file_read, file_write, http_get. It never executes anything itself.
+Every call it proposes goes through the same gate, whichever model it is:
 
     1. critic      the call is dry-run and, for shell, rehearsed in the jail
                    against a throwaway copy of the workdir. If what it would
@@ -25,8 +30,11 @@ proposes goes through the same gate:
                    output is withheld: what it read is exactly what must not
                    leave, and the model is where it would go.
 
-Needs the anthropic package and credentials (ANTHROPIC_API_KEY, or a profile
-from `ant auth login`). Without bubblewrap and strace no shell call runs.
+The anthropic backend needs the anthropic package and credentials
+(ANTHROPIC_API_KEY, or a profile from `ant auth login`). The openai-compatible
+backend needs only the server's URL, and a key if the server wants one (read
+from the environment variable --api-key-env names). Without bubblewrap and
+strace no shell call runs.
 
 Exit codes:
     0  the agent finished its turn (whatever the guard refused along the way)
@@ -37,7 +45,7 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import jail
+import backends, jail
 import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
 from decision import forbidden_of
@@ -50,7 +58,6 @@ from vow import Action, parse_vow
 
 MODEL = "claude-opus-5"
 MAX_TOKENS = 16000
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 # The default Vow for a guarded agent: the named harms, anything outside the
 # workdir that writes, and a real run that did what its rehearsal did not.
@@ -172,38 +179,25 @@ def _render(name, result):
     return "not fetched: the sandbox has no network"
 
 class GuardedAgent:
-    def __init__(self, client, gate, model=MODEL, max_turns=20):
-        self.client, self.gate, self.model, self.max_turns = client, gate, model, max_turns
-        self.messages = []
-
-    def _request(self):
-        return self.client.beta.messages.create(
-            model=self.model, max_tokens=MAX_TOKENS, system=SYSTEM, tools=TOOLS,
-            thinking={"type": "adaptive"}, messages=self.messages,
-            betas=[FALLBACK_BETA], fallbacks="default")
+    """The loop: ask the model, put every call it proposes through the gate,
+    hand back the results. `model_side` is a backend (backends.py), or an
+    Anthropic client, which is wrapped in the Anthropic backend."""
+    def __init__(self, model_side, gate, model=MODEL, max_turns=20):
+        self.backend = model_side if hasattr(model_side, "step") else \
+            backends.AnthropicBackend(model_side, model, SYSTEM, TOOLS, MAX_TOKENS)
+        self.gate, self.max_turns = gate, max_turns
 
     def run(self, task):
         """Returns (finished, final_text or the reason it stopped)."""
-        self.messages = [{"role": "user", "content": task}]
+        self.backend.start(task)
         for _ in range(self.max_turns):
-            response = self._request()
-            if response.stop_reason == "refusal":
-                return False, "the model declined the task"
-            self.messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "pause_turn":
-                continue
-            if response.stop_reason == "max_tokens":
-                return False, "the model ran out of output tokens mid-turn"
-            if response.stop_reason != "tool_use":
-                return True, "".join(b.text for b in response.content if b.type == "text")
-            # Every call in the turn goes through the gate; all results go back in one message.
-            results = []
-            for block in response.content:
-                if block.type != "tool_use": continue
-                content, is_error = self.gate.run(block.id, block.name, block.input)
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": content, "is_error": is_error})
-            self.messages.append({"role": "user", "content": results})
+            turn = self.backend.step()
+            if turn.stop == backends.REFUSAL: return False, "the model declined the task"
+            if turn.stop == backends.PAUSE: continue
+            if turn.stop == backends.MAX_TOKENS: return False, "the model ran out of output tokens mid-turn"
+            if turn.stop != backends.TOOL_USE: return True, turn.text
+            # Every call in the turn goes through the gate; all results go back together.
+            self.backend.reply([(i, *self.gate.run(i, name, args)) for i, name, args in turn.calls])
         return False, f"stopped after {self.max_turns} turns"
 
 def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None):
@@ -219,7 +213,7 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None):
     return gate, ledger
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Run Claude with every tool call guarded.")
+    ap = argparse.ArgumentParser(description="Run a model with every tool call it proposes guarded.")
     ap.add_argument("task")
     ap.add_argument("--workdir", default=None, help="default: a new temporary directory")
     ap.add_argument("--vow", type=pathlib.Path, help="a Vow file (default: the guarded-agent Vow)")
@@ -227,12 +221,20 @@ def main(argv=None):
                     help="a policy file (policy.py): sensitive paths, vetted commands, hosts")
     ap.add_argument("--ledger", help="write the ledger here")
     ap.add_argument("--max-turns", type=int, default=20)
-    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--backend", choices=["anthropic", "openai-compatible"], default="anthropic")
+    ap.add_argument("--model", help=f"default {MODEL} for anthropic; required for openai-compatible")
+    ap.add_argument("--base-url", help="openai-compatible: the server's API root, e.g. http://localhost:8000/v1")
+    ap.add_argument("--api-key-env", default="OPENAI_API_KEY",
+                    help="openai-compatible: environment variable holding the key, if the server wants one")
     args = ap.parse_args(argv)
-    try:
-        import anthropic
-    except ImportError:
-        print("the anthropic package is not installed (pip install anthropic)", file=sys.stderr); return 1
+    if args.backend == "openai-compatible":
+        if not args.base_url or not args.model:
+            print("the openai-compatible backend needs --base-url and --model", file=sys.stderr); return 1
+    else:
+        try:
+            import anthropic
+        except ImportError:
+            print("the anthropic package is not installed (pip install anthropic)", file=sys.stderr); return 1
     workdir = args.workdir or tempfile.mkdtemp(prefix="guarded_")
     try: pol = policy_mod.Policy.load(args.policy) if args.policy else policy_mod.DEFAULT
     except policy_mod.PolicyError as e:
@@ -240,8 +242,15 @@ def main(argv=None):
     gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol)
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
+    if args.backend == "openai-compatible":
+        backend = backends.OpenAICompatibleBackend(args.base_url, args.model, SYSTEM, TOOLS,
+                                                   api_key=os.environ.get(args.api_key_env))
+        try: finished, text = GuardedAgent(backend, gate, max_turns=args.max_turns).run(args.task)
+        except backends.BackendError as e:
+            print(str(e), file=sys.stderr); return 1
+        return _report(gate, ledger, pol, workdir, args, finished, text)
     try:
-        agent = GuardedAgent(anthropic.Anthropic(), gate, model=args.model, max_turns=args.max_turns)
+        agent = GuardedAgent(anthropic.Anthropic(), gate, model=args.model or MODEL, max_turns=args.max_turns)
         finished, text = agent.run(args.task)
     except anthropic.AuthenticationError as e:
         print(f"the API refused the credentials: {e}", file=sys.stderr); return 1
@@ -256,6 +265,9 @@ def main(argv=None):
         # TypeError is a bug and is not swallowed here.
         if "authentication method" not in str(e): raise
         print("no API credentials: set ANTHROPIC_API_KEY or run `ant auth login`", file=sys.stderr); return 1
+    return _report(gate, ledger, pol, workdir, args, finished, text)
+
+def _report(gate, ledger, pol, workdir, args, finished, text):
     for name, a, outcome, detail in gate.log:
         print(f"  {outcome:16s} {name} {json.dumps(a)[:100]}")
     print(text)

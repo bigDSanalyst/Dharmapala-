@@ -15,10 +15,15 @@ def evidence_of(calls, workdir, predicted):
 def evidence_digest(evidence):
     return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
 
-def effects_from_evidence(evidence):
-    """The one derivation of a run's effects. The executor uses it, and so
-    does a co-signer checking the executor's account."""
-    calls = [(t, k, r) for t, k, r in evidence["calls"]]
+def effects_from_evidence(evidence, reread=None):
+    """The one derivation of a run's effects from its events. The executor
+    uses the events jail.parse produced; a co-signer passes reread
+    (witness.events_for) to replace them with its own reading of the raw trace."""
+    calls = []
+    for t, k, r in evidence["calls"]:
+        if reread is not None and t == "shell" and isinstance(r, dict) and r.get("jailed"):
+            r = dict(r, events=reread(r, k.get("cmd", "")))
+        calls.append((t, k, r))
     effects = observe(calls, evidence["workdir"])
     # Reading, writing and running inside the workdir are what any plan does;
     # a real run that shows anything beyond them, unpredicted, has diverged.

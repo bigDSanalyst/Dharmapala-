@@ -50,7 +50,9 @@ class Sandbox:
                 ex = jail.run(cmd, str(self.workdir))
                 r = {"ok": ex.returncode == 0 and not ex.timed_out, "cmd": cmd, "jailed": True,
                      "returncode": ex.returncode, "stdout": ex.stdout[:2000],
-                     "timed_out": ex.timed_out, "events": ex.events}
+                     "timed_out": ex.timed_out, "events": ex.events,
+                     # the raw trace, so a co-signer can read it with its own parser (witness.py)
+                     "trace": {str(pid): text for pid, text in ex.trace.items()}}
             except jail.JailUnavailable as e:
                 r = {"ok": False, "cmd": cmd, "jailed": False, "error": f"not run: {e}"}
         else:

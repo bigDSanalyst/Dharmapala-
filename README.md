@@ -76,6 +76,19 @@ If the model writes a tool call into its answer as text instead of making it
 call(s) as text instead of making them (file_read notes.txt); they were not
 run`. Nothing written that way is ever run.
 
+Where the answer and the record can be compared exactly, the report says so
+under `where the answer and the record differ:`. Two cases are checked:
+
+- `content`: the answer shows a file's contents (a fenced block, or a block
+  after a line such as "notes.txt contains:"), but the record shows the file
+  last as something else.
+- `omitted`: the gate stopped calls, and the answer mentions neither what they
+  touched nor any refusal.
+
+Prose descriptions and anything after a lawful shell call, which may have
+changed any file, are not checked. No model is asked to judge, and the report
+names a difference, never a motive.
+
 With `--ledger`, the records are saved next to the ledger as
 `LEDGER.runs.jsonl`: append-only and hash-chained, each run's record matching
 the digest the ledger signed. The output of a call withheld from the model

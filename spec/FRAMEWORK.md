@@ -42,7 +42,7 @@
   - a dry run touches no filesystem, so it cannot see a symlink that leads out, a script's contents, a command inside `$(...)`, or a program's own file and socket calls. With the jail these are seen in the real run and judged there, and flagged `diverged` when unpredicted. Prevention for what the critic missed is the jail's containment, not the critic
   - the trace treats the dynamic loader's reads and libc's name-service files (`/etc/passwd` for `ls -l`) as the loader's doing. A plan that names them is caught from its arguments; a program that opens them itself is not, and any such program is `exec_unvetted` already
   - a program that detects it is being traced and behaves differently (an environmental trojan)
-  - the jail needs bubblewrap's unprivileged user namespaces; where the host forbids them, nothing runs
+  - the jail needs bubblewrap's unprivileged user namespaces; where the host forbids them, nothing runs. Ubuntu 23.10 and later restrict them through AppArmor by default; a deployment allows them (`kernel.apparmor_restrict_unprivileged_userns=0`) or gives bwrap an AppArmor profile, and the jail probe names this when it is the cause
   - the guard and co-signer share one observed effect set: the co-signer's verdict is independent, but its observation is not
 - Routine actions (no class) are judged and refused when they carry a forbidden effect, but they get no certificate
 - A loaded ledger (`Ledger.load`) is only as trustworthy as the keys it is checked against. Keys stored in the file prove only that the file agrees with itself. Pass `pinned={signer: key_id}`, or doctor reports `keys_from_the_file`. HMAC signers have no public key to store and must be supplied

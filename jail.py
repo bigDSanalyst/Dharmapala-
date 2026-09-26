@@ -53,7 +53,16 @@ def available():
     try:
         with tempfile.TemporaryDirectory() as d:
             r = run("true", d, _probe=True)
-        if r.returncode != 0: return False, f"jail probe exited {r.returncode}: {r.stderr.strip()[-200:]}"
+        if r.returncode != 0:
+            why = f"jail probe exited {r.returncode}: {r.stderr.strip()[-200:]}"
+            if "Operation not permitted" in r.stderr:
+                # Ubuntu 23.10+ lets unprivileged users create a user namespace
+                # but strips its capabilities through AppArmor, so bwrap cannot
+                # even bring up loopback (seen on GitHub's ubuntu-24.04 runners).
+                why += (" - unprivileged user namespaces look restricted; allow them "
+                        "(sysctl kernel.apparmor_restrict_unprivileged_userns=0) or give "
+                        "bwrap an AppArmor profile that permits userns")
+            return False, why
     except (JailUnavailable, OSError, subprocess.SubprocessError) as e:
         return False, f"jail probe failed: {e}"
     return True, ""

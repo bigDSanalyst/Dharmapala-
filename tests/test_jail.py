@@ -151,3 +151,14 @@ def test_an_unobserved_run_is_not_trusted(tmp_path, monkeypatch):
 def test_without_a_jail_the_sandbox_still_runs_nothing(tmp_path):
     r = Sandbox(tmp_path).shell("echo ran > proof.txt")
     assert r.get("blocked") and not (tmp_path / "proof.txt").exists()
+
+@pytest.mark.parametrize("err, hinted", [
+    ("bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted", True),   # GitHub ubuntu-24.04, run 17
+    ("bwrap: execvp sh: No such file or directory", False),
+])
+def test_a_restricted_host_is_named_as_the_cause(monkeypatch, err, hinted):
+    monkeypatch.setattr(jail.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(jail, "run", lambda *a, **k: jail.Execution(1, "", err))
+    ok, why = jail.available()
+    assert not ok and err in why
+    assert ("apparmor_restrict_unprivileged_userns" in why) == hinted

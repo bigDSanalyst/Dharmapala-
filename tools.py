@@ -25,7 +25,7 @@ class Sandbox:
         kwargs = {"path": str(path)}
         if self.dry_run: r = {"ok": True, "dry_run": True}
         else:
-            try: content = self._resolve(path).read_text()[:2000]; r = {"ok": True, "bytes": len(content)}
+            try: content = self._resolve(path).read_text()[:2000]; r = {"ok": True, "bytes": len(content), "content": content}
             except Exception as e: r = {"ok": False, "error": str(e)}
         self._record("file_read", kwargs, r); return r
     def file_write(self, path, content):

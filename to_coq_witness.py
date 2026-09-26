@@ -10,6 +10,8 @@ class CoqWitness:
         if s.startswith("(*") or s.startswith("//"):
             raise ValueError(f"witness {self.name!r}: statement is a comment")
 
+COQC_TIMEOUT = 60.0
+
 class Certificate:
     def __init__(self, label):
         self.label = label; self.witnesses = []; self.preamble = []
@@ -29,19 +31,25 @@ class Certificate:
         with open(path, "w") as f: f.write("\n".join(lines))
         return path
     @staticmethod
-    def check(path, timeout=60.0):
-        # True: coqc accepted it. False: coqc ran and rejected it (or hung).
-        # None: coqc could not be run, so nothing was checked.
-        if shutil.which("coqc") is None: return None, "coqc not in PATH"
+    def check(path, timeout=None):
+        # True: coqc accepted it. False: coqc ran and rejected it.
+        # None: nothing was checked - coqc is missing, will not run, or hung.
+        # A hang is not a rejection: reading it as one would refuse a correct
+        # certificate and record the machine's slowness as the agent's refusal.
+        timeout = COQC_TIMEOUT if timeout is None else timeout
+        coqc = shutil.which("coqc")
+        if coqc is None: return None, "coqc not in PATH"
         try:
-            proc = subprocess.run(["coqc", path], capture_output=True,
+            # Run the coqc that was found, not the name: if that one will not
+            # execute, exec would quietly go on to the next coqc on PATH.
+            proc = subprocess.run([coqc, path], capture_output=True,
                                   text=True, timeout=timeout)
             for ext in (".vo", ".glob", ".vok", ".vos"):
                 try: os.remove(path.replace(".v", ext))
                 except FileNotFoundError: pass
             return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired:
-            return False, f"coqc timeout after {timeout}s"
+            return None, f"coqc timed out after {timeout}s: not checked"
         except OSError as e:
             return None, f"coqc found but could not run: {e}"
     def certificate_hash(self):

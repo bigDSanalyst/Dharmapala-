@@ -338,3 +338,8 @@ def test_a_cut_that_erases_no_audits_while_later_ones_live(binary):
     assert r.L.verify_integrity() and verify_archive(archive, cp)[0]
     r.run(AFTER[1], binary)
     assert r.L.verify_integrity()
+
+
+def test_an_empty_ledger_has_nothing_to_compress():
+    r = Rig()
+    with pytest.raises(CompressionError, match="nothing to erase"): compress(r.L, 0, r.compressor)

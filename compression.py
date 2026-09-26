@@ -12,10 +12,11 @@
 # Nothing here is lossy or learned: a summary no one can check against the
 # originals would be a self-declared claim, which is what this framework
 # exists to avoid. Two things this layer does not give you:
-#   - The summary is signed, not proven. Until someone runs verify_archive,
-#     trusting it means trusting the compressor's key. (A recursive proof
-#     - folding / IVC - that every erased entry verified would remove that
-#     trust; the `proof` slot is where one would go.)
+#   - The summary is not proven up front. It is committed step by step
+#     (trace_root), so anyone holding the archive can convict a wrong summary
+#     with a fraud proof that others check without the archive (fraud.py).
+#     That rests on one honest archive holder looking. A validity proof
+#     (folding / IVC) would not; the `proof` slot is reserved for one.
 #   - A checkpoint says nothing about when it was made; its hash() is what to
 #     anchor with an external timestamp.
 import hashlib, json
@@ -40,6 +41,7 @@ class Checkpoint:
     audit_bridge: str; audit_head: str
     summary_json: str               # cumulative carried state, canonical JSON
     prev_checkpoint: str; signer_id: str
+    trace_root: str = ""            # Merkle root of the fold, one leaf per erased entry
     proof: str = ""                 # reserved for a succinct proof of the erased segment
     signature: str = ""
     def payload(self):
@@ -48,7 +50,7 @@ class Checkpoint:
             self.audits_from, self.audits_through, self.records_root, self.audits_root,
             self.record_bridge, self.record_head, self.audit_bridge, self.audit_head,
             hashlib.sha256(self.summary_json.encode()).hexdigest(),
-            self.prev_checkpoint, self.signer_id, self.proof)).encode()
+            self.prev_checkpoint, self.signer_id, self.proof, self.trace_root)).encode()
     def hash(self): return hashlib.sha256(self.payload()).hexdigest()
     @property
     def summary(self): return json.loads(self.summary_json)
@@ -59,6 +61,7 @@ class Archive:
     records: list = field(default_factory=list)
     audits: list = field(default_factory=list)
     attestations: dict = field(default_factory=dict)
+    trace: list = field(default_factory=list)       # TraceLeaf per erased entry, in fold order
 
 def empty_summary():
     return {"outcomes": "", "guards": {}, "trajectory_state": None}
@@ -67,26 +70,68 @@ def _guard(summary, gid):
     return summary["guards"].setdefault(
         gid, {"punya": 0.0, "proven": 0, "refused": 0, "classes": [], "refused_classes": {}})
 
+def is_audit(entry): return hasattr(entry, "prev_audit_hash")
+
+def sort_key(entry):
+    # Engagement order: an audit written at epoch k precedes record k.
+    return (entry.epoch, 0, entry.index) if is_audit(entry) else (entry.index, 1, entry.index)
+
+def events(records, audits):
+    return sorted(list(records) + list(audits), key=sort_key)
+
+def step(state, entry):
+    """One erased entry's effect on the carried state. The fold is nothing
+    but this, applied in engagement order, so each step can be checked alone."""
+    s = json.loads(json.dumps(state))
+    if is_audit(entry):
+        s["outcomes"] += "1"
+        g = _guard(s, entry.guard_id); g["refused"] += 1
+        base = entry.class_id.split(":shoshin-")[0]
+        g["refused_classes"][base] = g["refused_classes"].get(base, 0) + 1
+    else:
+        s["outcomes"] += "1" if entry.verdict_kind == "LEARNING" else "0"
+        g = _guard(s, entry.guard_id)
+        g["punya"] += entry.punya_delta; g["proven"] += 1
+        if entry.class_id and entry.verdict_kind in ("LAWFUL", "LEARNING") \
+                and entry.class_id not in g["classes"]:
+            g["classes"] = sorted(g["classes"] + [entry.class_id])
+        s["trajectory_state"] = list(entry.trajectory_state)
+    return s
+
 def fold(summary, records, audits):
     """Carry state forward over an erased segment. Everything the guard,
     adversary and drift monitor read from erased entries lands here."""
     s = json.loads(json.dumps(summary))
-    events = [(a.epoch, 0, i, True) for i, a in enumerate(audits)]
-    events += [(r.index, 1, i, r.verdict_kind == "LEARNING") for i, r in enumerate(records)]
-    s["outcomes"] += "".join("1" if refused else "0" for *_, refused in sorted(events))
-    for r in records:
-        g = _guard(s, r.guard_id)
-        g["punya"] += r.punya_delta; g["proven"] += 1
-        if r.class_id and r.verdict_kind in ("LAWFUL", "LEARNING") and r.class_id not in g["classes"]:
-            g["classes"] = sorted(g["classes"] + [r.class_id])
-    for a in audits:
-        g = _guard(s, a.guard_id); g["refused"] += 1
-        base = a.class_id.split(":shoshin-")[0]
-        g["refused_classes"][base] = g["refused_classes"].get(base, 0) + 1
-    if records: s["trajectory_state"] = list(records[-1].trajectory_state)
+    for e in events(records, audits): s = step(s, e)
     return s
 
 def _canon(s): return json.dumps(s, sort_keys=True, separators=(",", ":"))
+
+def state_digest(state): return hashlib.sha256(_canon(state).encode()).hexdigest()
+
+@dataclass(frozen=True)
+class TraceLeaf:
+    """Step k of the fold: which entry it consumed (its chain and position),
+    how many of each chain were consumed so far, and the state after it."""
+    k: int; kind: str; pos: int; entry_hash: str
+    n_records: int; n_audits: int; state: str       # state_digest after the step
+    def digest(self):
+        return hashlib.sha256(f"leaf/v1|{self.k}|{self.kind}|{self.pos}|{self.entry_hash}|"
+                              f"{self.n_records}|{self.n_audits}|{self.state}".encode()).hexdigest()
+
+def trace(prev_summary, records, audits):
+    """The honest fold, one leaf per step. Returns (leaves, states)."""
+    leaves, states, s = [], [], prev_summary
+    nr = na = 0
+    for k, e in enumerate(events(records, audits)):
+        s = step(s, e)
+        if is_audit(e): na += 1; kind, pos = "audits", na - 1
+        else: nr += 1; kind, pos = "records", nr - 1
+        leaves.append(TraceLeaf(k, kind, pos, e.hash(), nr, na, state_digest(s)))
+        states.append(s)
+    return leaves, states
+
+def trace_root(leaves): return merkle_root([l.digest() for l in leaves])
 
 def _cited(records, audits):
     out = set()
@@ -104,8 +149,9 @@ def compress(ledger, cut_epoch, signer):
     if signer.id not in ledger.verifiers:
         raise CompressionError(f"signer {signer.id!r} has no registered verifier")
     last = ledger.checkpoints[-1] if ledger.checkpoints else None
-    if last is not None and cut_epoch <= last.cut_epoch:
-        raise CompressionError(f"cut {cut_epoch} is not past the last checkpoint ({last.cut_epoch})")
+    if cut_epoch <= (last.cut_epoch if last else 0):
+        raise CompressionError(f"cut {cut_epoch} is not past the last checkpoint "
+                               f"({last.cut_epoch if last else 0}): nothing to erase")
     if cut_epoch > ledger.next_record_index():
         raise CompressionError(f"cut {cut_epoch} is beyond the ledger ({ledger.next_record_index()})")
     recs = [r for r in ledger.records if r.index < cut_epoch]
@@ -117,7 +163,8 @@ def compress(ledger, cut_epoch, signer):
     # and ends there, whatever live entries come after the cut.
     r_start = last.record_head if last else ledger.genesis_hash
     a_start = last.audit_head if last else GENESIS_HASH
-    summary = fold(last.summary if last else empty_summary(), recs, auds)
+    leaves, states = trace(last.summary if last else empty_summary(), recs, auds)
+    summary = states[-1] if states else (last.summary if last else empty_summary())
     cp = Checkpoint(
         cut_epoch=cut_epoch,
         records_from=r_from, records_through=r_from + len(recs) - 1,
@@ -130,12 +177,13 @@ def compress(ledger, cut_epoch, signer):
         audit_head=auds[-1].hash() if auds else a_start,
         summary_json=_canon(summary),
         prev_checkpoint=last.hash() if last else GENESIS_HASH,
-        signer_id=signer.id)
+        signer_id=signer.id, trace_root=trace_root(leaves))
     cp = replace(cp, signature=signer.sign(cp.payload()).hex())
     keep_r, keep_a = ledger.records[len(recs):], ledger.audits[len(auds):]
     erased_att = _cited(recs, auds) - _cited(keep_r, keep_a)
     archive = Archive(cp.hash(), list(recs), list(auds),
-                      {h: ledger.attestations[h] for h in erased_att if h in ledger.attestations})
+                      {h: ledger.attestations[h] for h in erased_att if h in ledger.attestations},
+                      list(leaves))
     ledger.checkpoints.append(cp)
     ledger.records[:] = keep_r; ledger.audits[:] = keep_a
     for h in erased_att: ledger.attestations.pop(h, None)
@@ -170,8 +218,12 @@ def verify_archive(archive, checkpoint, previous_summary=None, verifiers=None):
     if prev != checkpoint.audit_head: return False, "audit head mismatch"
     if any(r.index >= checkpoint.cut_epoch for r in recs) or any(a.epoch >= checkpoint.cut_epoch for a in auds):
         return False, "an archived entry is past the cut"
-    if _canon(fold(previous_summary or empty_summary(), recs, auds)) != checkpoint.summary_json:
+    leaves, states = trace(previous_summary or empty_summary(), recs, auds)
+    final = states[-1] if states else (previous_summary or empty_summary())
+    if _canon(final) != checkpoint.summary_json:
         return False, "carried summary does not match the archived entries"
+    if trace_root(leaves) != checkpoint.trace_root:
+        return False, "trace root does not match the archived entries"
     if verifiers is not None:
         for h, a in archive.attestations.items():
             v = verifiers.get(a.signer_id)

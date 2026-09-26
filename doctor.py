@@ -19,6 +19,10 @@ def observe(ledger):
                                 "verify_integrity() returned False",
                                 "a chain link, stored attestation or signature does not verify; "
                                 "do not trust this ledger until it is found"))
+    for i in (ledger.convicted() if hasattr(ledger, "convicted") else []):
+        findings.append(Finding("BLOCK", "checkpoint_convicted",
+                                f"checkpoint {i} ({ledger.checkpoints[i].hash()[:16]}) is shown wrong by a fraud proof",
+                                "its carried state cannot be trusted; rebuild from the archive with verify_archive"))
     if ledger.audits:
         findings.append(Finding("LOOK", "refusals_present",
                                 f"{len(ledger.audits)} refusals recorded"))
@@ -28,6 +32,11 @@ def observe(ledger):
         findings.append(Finding("DEGRADED", "unchecked_certificates",
                                 f"{len(unchecked)} attestation(s) signed without coqc checking the certificate",
                                 "install coqc (apt install coq) and re-run"))
+    if getattr(ledger, "unpinned", ()):
+        findings.append(Finding("LOOK", "keys_from_the_file",
+                                f"{', '.join(ledger.unpinned)}: public keys were read from the ledger file "
+                                "itself, so verification shows only that the file agrees with itself",
+                                "pass pinned={signer: key_id} to Ledger.load"))
     shared = sorted(v.id for v in ledger.verifiers.values() if not v.publicly_verifiable)
     if shared:
         findings.append(Finding("DEGRADED", "shared_secret_signers",

@@ -108,12 +108,19 @@ def main():
     # reports may change.
     s_cmp = default_signer("Compressor"); ledger.register_verifier(verifier_for(s_cmp))
     report_before = guard.report
-    size_before = os.path.getsize(ledger.path)
-    cp, archive = compress(ledger, ledger.next_record_index(), s_cmp)
-    archive_ok, archive_why = verify_archive(archive, cp, verifiers=ledger.verifiers)
-    print(f"\n  [compression] {len(archive.records)} records, {len(archive.audits)} audits, "
-          f"{len(archive.attestations)} attestations -> checkpoint {cp.hash()[:16]}...; "
-          f"ledger file {size_before} -> {os.path.getsize(ledger.path)} bytes; archive: {archive_why}")
+    if ledger.next_record_index() > 0:
+        size_before = os.path.getsize(ledger.path)
+        cp, archive = compress(ledger, ledger.next_record_index(), s_cmp)
+        archive_ok, archive_why = verify_archive(archive, cp, verifiers=ledger.verifiers)
+        print(f"\n  [compression] {len(archive.records)} records, {len(archive.audits)} audits, "
+              f"{len(archive.attestations)} attestations -> checkpoint {cp.hash()[:16]}...; "
+              f"ledger file {size_before} -> {os.path.getsize(ledger.path)} bytes; archive: {archive_why}")
+    else:
+        # Nothing was recorded, so there is nothing to compress - and nothing
+        # was shown lossless. That is a failed check, not a vacuous pass.
+        from compression import Archive
+        archive, archive_ok = Archive(""), False
+        print("\n  [compression] nothing recorded, nothing to compress")
 
     ensemble.reveal_index()
     transcripts = ensemble.verify_transcript(
@@ -126,7 +133,7 @@ def main():
     # A layer that did not run is not a layer that passed. Each entry names
     # what was checked, whether it really ran, and what to install if not.
     layers = [
-        ("lean critic", which_critic() == "lean",
+        ("lean critic", which_critic() == "lean" and critic.unchecked == 0,
          f"{critic_status()}; install Lean (version in lean/lean-toolchain) and put `lean` on PATH"),
         ("coq certificates", bool(certs) and all(c == "coqc-pass" for c in certs),
          "apt install coq"),

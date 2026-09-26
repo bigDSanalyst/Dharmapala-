@@ -12,6 +12,7 @@ class CriticLoop:
         self.max_retries = max_retries; self.verbose = verbose
         self.guard = guard
         self.attempts = []
+        self.unchecked = 0      # attempts the critic could not judge at all
     def propose_and_verify(self, goal):
         context = ""
         for attempt in range(self.max_retries):
@@ -21,6 +22,15 @@ class CriticLoop:
             effects = observe(dry.calls, dry.workdir)
             source, violations = emit_vow_compliance(effects, self.vow)
             ok, error = check(source, self.lake_root)
+            if ok is None:
+                # The critic did not judge this plan. Nothing may execute, and
+                # nothing is recorded against the agent: it did nothing wrong.
+                self.unchecked += 1
+                self.attempts.append({"attempt": attempt + 1, "effects": sorted(effects),
+                                      "violations": violations, "lean_ok": None,
+                                      "accepted": False, "unchecked": error})
+                if self.verbose: print(f"    critic could not judge: {error.splitlines()[0][:100]}")
+                return set(), False, []
             lean_ok = ok
             if ok and violations:
                 # Lean and Python answer the same question from the same list;

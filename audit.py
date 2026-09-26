@@ -22,9 +22,11 @@ class AuditEntry:
                 f"{self.action_digest}")
         return hashlib.sha256(payload.encode()).hexdigest()
 
-def verify_audit_chain(audits):
+def verify_audit_chain(audits, start_index=0, start_hash=GENESIS_HASH):
+    # start_index and start_hash are where a compression checkpoint left the
+    # chain (compression.py); a ledger never compressed starts at genesis.
     for i, a in enumerate(audits):
-        expected = audits[i - 1].hash() if i > 0 else GENESIS_HASH
+        expected = audits[i - 1].hash() if i > 0 else start_hash
         if a.prev_audit_hash != expected: return False
-        if a.index != i: return False
+        if a.index != start_index + i: return False
     return True

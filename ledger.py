@@ -18,7 +18,7 @@ class Ledger:
     records: list = field(default_factory=list)
     attestations: dict = field(default_factory=dict)
     audits: list = field(default_factory=list)
-    compressions: list = field(default_factory=list)
+    checkpoints: list = field(default_factory=list)   # compression.Checkpoint, oldest first
     verifiers: dict = field(default_factory=dict)
 
     def register_verifier(self, v):
@@ -39,22 +39,39 @@ class Ledger:
             raise ValueError("audit out of order")
         self.audits.append(entry); self._persist()
     def _records_offset(self):
-        return sum(c.through_index + 1 for c in self.compressions if c.kind == "records")
+        return self.checkpoints[-1].records_through + 1 if self.checkpoints else 0
     def _audits_offset(self):
-        return sum(c.through_index + 1 for c in self.compressions if c.kind == "audits")
+        return self.checkpoints[-1].audits_through + 1 if self.checkpoints else 0
+    def next_record_index(self): return len(self.records) + self._records_offset()
     def head_hash(self):
-        return self.records[-1].hash() if self.records else self.genesis_hash
+        if self.records: return self.records[-1].hash()
+        return self.checkpoints[-1].record_head if self.checkpoints else self.genesis_hash
     def audit_head(self):
-        return self.audits[-1].hash() if self.audits else AUDIT_GENESIS
+        if self.audits: return self.audits[-1].hash()
+        return self.checkpoints[-1].audit_head if self.checkpoints else AUDIT_GENESIS
+    # State that outlives compression: what the last checkpoint carried
+    # forward from erased entries. Readers add the live entries to it.
+    def carried(self):
+        from compression import empty_summary
+        return self.checkpoints[-1].summary if self.checkpoints else empty_summary()
+    def carried_guard(self, guard_id):
+        return self.carried()["guards"].get(guard_id, {"punya": 0.0, "proven": 0, "refused": 0,
+                                                       "classes": [], "refused_classes": {}})
+    def trajectory_head(self):
+        if self.records: return self.records[-1].trajectory_state
+        t = self.carried()["trajectory_state"]
+        return tuple(t) if t is not None else ()
     def verify_integrity(self):
-        if self.records and not self._records_offset():
-            if self.records[0].prev_hash != self.genesis_hash: return False
-        if self.records:
-            for i in range(1, len(self.records)):
-                if self.records[i].prev_hash != self.records[i-1].hash(): return False
+        if not self._checkpoints_ok(): return False
+        start = self.checkpoints[-1].record_head if self.checkpoints else self.genesis_hash
+        for i, r in enumerate(self.records):
+            if r.index != self._records_offset() + i: return False
+            if r.prev_hash != (self.records[i-1].hash() if i else start): return False
         if self.audits:
             for i in range(1, len(self.audits)):
                 if self.audits[i].prev_audit_hash != self.audits[i-1].hash(): return False
+        cut = self.checkpoints[-1].cut_epoch if self.checkpoints else 0
+        if any(a.epoch < cut for a in self.audits): return False
         cited = set()
         for r in self.records:
             if r.attestation_hash and not isinstance(self.attestations.get(r.attestation_hash), Attestation):
@@ -76,7 +93,29 @@ class Ledger:
                 return False
         if not all(self.signature_ok(h, a) for h, a in self.attestations.items()):
             return False
-        if not verify_audit_chain(self.audits): return False
+        a_start = self.checkpoints[-1].audit_head if self.checkpoints else AUDIT_GENESIS
+        if not verify_audit_chain(self.audits, self._audits_offset(), a_start): return False
+        return True
+    def _checkpoints_ok(self):
+        # Each checkpoint is signed by a registered verifier, links to the one
+        # before, and picks up both chains exactly where that one left off.
+        prev_hash, r_next, a_next, r_head, a_head, cut = "0" * 64, 0, 0, self.genesis_hash, AUDIT_GENESIS, 0
+        for c in self.checkpoints:
+            v = self.verifiers.get(c.signer_id)
+            if v is None or not c.signature: return False
+            try: sig = bytes.fromhex(c.signature)
+            except ValueError: return False
+            if not v.verify(c.payload(), sig): return False
+            if c.prev_checkpoint != prev_hash or c.cut_epoch <= cut: return False
+            if (c.records_from, c.audits_from) != (r_next, a_next): return False
+            if c.records_through + 1 != c.cut_epoch: return False
+            if c.records_through >= c.records_from and c.record_bridge != r_head: return False
+            if c.records_through < c.records_from and c.record_head != r_head: return False
+            if c.audits_through >= c.audits_from and c.audit_bridge != a_head: return False
+            if c.audits_through < c.audits_from and c.audit_head != a_head: return False
+            prev_hash, cut = c.hash(), c.cut_epoch
+            r_next, a_next = c.records_through + 1, c.audits_through + 1
+            r_head, a_head = c.record_head, c.audit_head
         return True
     def signature_ok(self, key, a):
         # An attestation counts only if it is stored under its own hash and
@@ -98,5 +137,6 @@ class Ledger:
             json.dump({"sangha_id": self.sangha_id,
                        "records": [r.__dict__ for r in self.records],
                        "attestations": {h: a.__dict__ for h, a in self.attestations.items()},
-                       "audits": [a.__dict__ for a in self.audits]},
+                       "audits": [a.__dict__ for a in self.audits],
+                       "checkpoints": [c.__dict__ for c in self.checkpoints]},
                       f, indent=2, sort_keys=True, default=str)

@@ -28,24 +28,29 @@ class Guard:
     def current_hash(self): return self.ledger.head_hash()
     @property
     def punya(self):
-        return sum(r.punya_delta for r in self.ledger.records if r.guard_id == self.id)
+        return self.ledger.carried_guard(self.id)["punya"] + sum(
+            r.punya_delta for r in self.ledger.records if r.guard_id == self.id)
+    @property
+    def proven(self):
+        return self.ledger.carried_guard(self.id)["proven"] + sum(
+            1 for r in self.ledger.records if r.guard_id == self.id)
     @property
     def stage(self):
         n = int(self.punya / 10.0)
         return STAGES[min(n, len(STAGES) - 1)]
     @property
     def refusals(self):
-        return sum(1 for a in self.ledger.audits if a.guard_id == self.id)
+        return self.ledger.carried_guard(self.id)["refused"] + sum(
+            1 for a in self.ledger.audits if a.guard_id == self.id)
     @property
     def confidence(self):
-        proven = sum(1 for r in self.ledger.records if r.guard_id == self.id)
-        if proven + self.refusals == 0: return 1.0
-        return proven / (proven + self.refusals)
+        if self.proven + self.refusals == 0: return 1.0
+        return self.proven / (self.proven + self.refusals)
     @property
     def report(self):
         return {"id": self.id, "stage": self.stage, "punya": self.punya,
-                "proven": sum(1 for r in self.ledger.records if r.guard_id == self.id),
-                "refused": self.refusals, "confidence": self.confidence}
+                "proven": self.proven, "refused": self.refusals,
+                "confidence": self.confidence}
     def integrity(self): return self.ledger.verify_integrity()
     def record_refusal(self, class_id, reason, notes=(), certificate_path="",
                        attestation_hash="", trajectory_attestation="", action_digest=""):
@@ -53,7 +58,7 @@ class Guard:
             index=len(self.ledger.audits) + self.ledger._audits_offset(),
             prev_audit_hash=self.ledger.audit_head(),
             record_head_ref=self.ledger.head_hash(),
-            epoch=len(self.ledger.records),
+            epoch=self.ledger.next_record_index(),
             guard_id=self.id, class_id=class_id, reason=reason,
             co_signer_notes=tuple(notes), certificate_path=certificate_path,
             attestation_hash=attestation_hash,
@@ -79,8 +84,7 @@ class Guard:
         if traj_clauses:
             from trajectory import TrajectoryChecker
             checker = TrajectoryChecker(traj_clauses)
-            prior = (self.ledger.records[-1].trajectory_state
-                     if self.ledger.records else ())
+            prior = self.ledger.trajectory_head()   # survives compression
             if len(prior) != len(checker.automata): prior = checker.initial()
             new_state, violations = checker.evaluate_state(prior, action)
             immediate = [v for v in violations if not v.endswith(":pending")]
@@ -104,10 +108,10 @@ class Guard:
                                action.id, self.id)
         outputs = re_run_fn(inputs)
         decision = Decision.of(action, vow)
-        cert = build_certificate(f"{self.id}_{len(self.ledger.records)}", outputs, decision)
+        cert = build_certificate(f"{self.id}_{self.ledger.next_record_index()}", outputs, decision)
         cert_path = cert.emit()
         proposal = propose(engine_id=self.id, engine_name="guard",
-                           binary_hash=binary_hash, epoch=len(self.ledger.records),
+                           binary_hash=binary_hash, epoch=self.ledger.next_record_index(),
                            inputs=inputs, cert=cert, outputs=outputs,
                            co_signer_id=co_signer.id, decision=decision)
         try:

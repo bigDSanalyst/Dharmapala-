@@ -53,9 +53,11 @@ class Adversary:
         self._committed_ids = tuple(ids)
         return c
     def _proven(self, guard):
-        return {r.class_id for r in guard.ledger.records
-                if r.guard_id == guard.id and r.class_id
-                and r.verdict_kind in ("LAWFUL", "LEARNING")}
+        carried = set(guard.ledger.carried_guard(guard.id)["classes"]) \
+            if hasattr(guard.ledger, "carried_guard") else set()
+        return carried | {r.class_id for r in guard.ledger.records
+                          if r.guard_id == guard.id and r.class_id
+                          and r.verdict_kind in ("LAWFUL", "LEARNING")}
     def _select(self, guard, beacon, guard_nonce=b""):
         proven = self._proven(guard)
         proven_base = {c.split(":shoshin-")[0] for c in proven}
@@ -63,7 +65,8 @@ class Adversary:
                       if c.id not in proven
                       and c.id.split(":shoshin-")[0] not in proven_base]
         if not candidates:
-            refusals = {}
+            refusals = dict(guard.ledger.carried_guard(guard.id)["refused_classes"]) \
+                if hasattr(guard.ledger, "carried_guard") else {}
             for a in guard.ledger.audits:
                 if a.guard_id == guard.id:
                     base = a.class_id.split(":shoshin-")[0]

@@ -152,7 +152,13 @@ class CoSigner:
                 if evidence_digest(evidence) != decision.evidence_digest:
                     self.notes.append("evidence: MISMATCH")
                     raise RefusedToSign("run record does not match the digest the decision cites")
-                seen = tuple(sorted(effects_from_evidence(evidence)))
+                # Read the raw trace with the co-signer's own parser, not the
+                # events the guard's side parsed from it (witness.py).
+                import witness
+                try: seen = tuple(sorted(effects_from_evidence(evidence, reread=witness.events_for)))
+                except witness.Unreadable as e:
+                    self.notes.append("trace: UNREADABLE")
+                    raise RefusedToSign(f"co-signer cannot read the run's trace: {e}")
                 if seen != decision.effects:
                     self.notes.append("effects: MISMATCH")
                     raise RefusedToSign(f"co-signer observed {list(seen)} where the guard reports {list(decision.effects)}")

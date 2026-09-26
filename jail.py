@@ -44,6 +44,7 @@ class JailUnavailable(Exception): pass
 class Execution:
     returncode: int; stdout: str; stderr: str
     events: list = field(default_factory=list)      # (kind, detail, succeeded)
+    trace: dict = field(default_factory=dict)       # {pid: raw strace text}, for an independent reading
     timed_out: bool = False
 
 def available():
@@ -104,7 +105,7 @@ def run(cmd, workdir, timeout=None, _probe=False):
     events = parse(per_pid, cmd)
     if not _probe and events is None:
         raise JailUnavailable("the trace never shows the command starting; not trusting an unobserved run")
-    return Execution(rc, out, err, events or [], to)
+    return Execution(rc, out, err, events or [], trace=per_pid, timed_out=to)
 
 _LINE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(-?\d+|\?)(.*)$")
 _STR = re.compile(r'"((?:[^"\\]|\\.)*)"')

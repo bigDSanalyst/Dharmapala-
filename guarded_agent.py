@@ -246,6 +246,17 @@ def main(argv=None):
     except policy_mod.PolicyError as e:
         print(f"policy: {e}", file=sys.stderr); return 1
     runs_path = args.runs or (args.ledger + ".runs.jsonl" if args.ledger else None)
+    # A run's ledger would replace the file there, and its records would be
+    # appended to the ones there: the two would no longer describe one run.
+    # A run never overwrites one record or continues another.
+    for what, path in (("ledger", args.ledger), ("run records", runs_path)):
+        if path and os.path.exists(path):
+            print(f"{what}: {path} already exists; choose a new --ledger"
+                  + (" and --runs" if args.runs else "")
+                  + " (a run never overwrites one record or appends to another)", file=sys.stderr)
+            return 1
+    if args.ledger and runs_path and os.path.abspath(args.ledger) == os.path.abspath(runs_path):
+        print("--ledger and --runs name the same file; give each its own", file=sys.stderr); return 1
     gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path)
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
@@ -306,7 +317,7 @@ def _report(gate, ledger, pol, workdir, args, finished, text):
               f"({names}); they were not run")
     # The model's answer is its own claim. Beside it, what the record shows.
     print("\nwhat actually happened (from the run record, not the model):")
-    for line in runs.account(gate.runs.entries) or ["(no calls)"]: print("  " + line)
+    for line in runs.account(gate.runs.this_run) or ["(no calls)"]: print("  " + line)
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
           + (f"  runs: {gate.runs.path}" if gate.runs.path else "")
           + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")

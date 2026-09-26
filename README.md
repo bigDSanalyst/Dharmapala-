@@ -71,6 +71,11 @@ That example is from the first live run. A 7B model wrote a placeholder into
 the file and then reported the file's intended contents, and in a second run
 it said "no credentials here" about a `.env` it had just been refused.
 
+If the model writes a tool call into its answer as text instead of making it
+(small local models do), the report names it: `note: the model wrote 1 tool
+call(s) as text instead of making them (file_read notes.txt); they were not
+run`. Nothing written that way is ever run.
+
 With `--ledger`, the records are saved next to the ledger as
 `LEDGER.runs.jsonl`: append-only and hash-chained, each run's record matching
 the digest the ledger signed. The output of a call withheld from the model

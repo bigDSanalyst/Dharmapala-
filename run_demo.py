@@ -17,7 +17,7 @@ from agent import Agent
 from vrf import GuardNonce, Counterparty
 from lake_critic import which_critic, critic_status
 from compression import compress, verify_archive
-from critic_loop import execute
+from critic_loop import execute, evidence_of
 import jail
 
 VOW_SOURCE = """
@@ -72,7 +72,7 @@ def main():
     jail_ok, jail_why = jail.available()
     print(f"[jail] {'bubblewrap + strace' if jail_ok else 'unavailable: ' + jail_why}")
     agent = Agent(Sandbox(os.path.join(tmpdir, "dry")))
-    critic = CriticLoop(agent, vow, verbose=True, guard=guard)
+    critic = CriticLoop(agent, vow, verbose=True, guard=guard, rehearse=jail_ok)
 
     print("=" * 68)
     print("  DHARMAPALA — critic loop + ensemble + 12 layers")
@@ -88,7 +88,7 @@ def main():
                                                           guard_nonce=gn.reveal())):
             if eng is not None:
                 print(f"    [adv {i}] would select: {eng.class_id}")
-        effects, ok, plan = critic.propose_and_verify(goal)
+        effects, ok, plan = critic.propose_and_verify(goal, workdir=os.path.join(tmpdir, f"sb_{epoch}"))
         if not ok:
             print("    -> no compliant plan"); verdicts[epoch] = "NO_PLAN"; continue
         if not plan:
@@ -96,11 +96,13 @@ def main():
             verdicts[epoch] = "ABSTAINED"; continue
         # Shell commands really run only inside the jail; without one they are
         # recorded and not run, and the jail layer below reports it.
-        observed, _ = execute(plan, effects, os.path.join(tmpdir, f"sb_{epoch}"), jail=jail_ok)
+        workdir = os.path.join(tmpdir, f"sb_{epoch}")
+        observed, calls = execute(plan, effects, workdir, jail=jail_ok)
         executed.append(observed)
         print(f"    executed plan: {len(plan)} call(s) -> observed={sorted(observed)}")
         action = Action(id=f"a{epoch}", verb="execute", domain="action", payload={})
         action._observed_effects = observed
+        action._evidence = evidence_of(calls, workdir, effects)   # the co-signer re-derives from this
         inputs = {"butterflies": [(100 + epoch, 200, 17)]}
         verdict = guard.engage(action, vow, beta, tb, f"c{epoch}", inputs,
                                 engine_run, bp, bh)

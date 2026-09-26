@@ -13,7 +13,7 @@
 1.  Compiled C engine (SHA-256 bound)
 2.  Coq certificate: the engine's arithmetic and the verdict itself (`decision.py`)
 3.  Lean certificate
-4.  Co-signer re-run (runtime binding): re-runs the engine, reaches its own verdict, rebuilds the certificate and runs coqc on what it built, never on the file it was handed; signs the action digest, verdict and Vow hash
+4.  Co-signer re-run (runtime binding): re-runs the engine, reaches its own verdict, rebuilds the certificate and runs coqc on what it built, never on the file it was handed; signs the action digest, verdict and Vow hash. When the effects come from a real run, the decision cites that run's record (`critic_loop.evidence_of`: calls, results, jail trace events, workdir, prediction) by digest, and the co-signer re-derives the effects from the record with the executor's own derivation (`effects_from_evidence`), refusing when they differ from the guard's account; the digest is signed
 5.  Record chain: a record may cite only an attestation for its own action, verdict and Vow, and only once
 6.  Audit chain (mutual anchoring)
 7.  Compression, commit-before-erase (`compression.py`): before erasing old records and audits, a signed checkpoint commits to each chain (Merkle root and head) and carries forward all the state the guard still reads (merit, proven classes, refusal counts, drift history, trajectory state). The erased entries go to an archive that `verify_archive` checks against the checkpoint by recomputing everything. Lossless by design: a learned or lossy summary could not be checked against what it replaced
@@ -24,6 +24,7 @@
 12. E-process drift monitor
 
 ## Beyond the twelve
+- Rehearsal (`critic_loop.rehearse`): before the critic accepts a plan, the plan runs in the jail against a throwaway copy of its workdir, and the critic judges what that run did as well as what the dry run predicted. The rehearsal then becomes the prediction the real run is held to for `diverged`. A script already in the workdir, which no dry run can see, is rehearsed like everything else. If the jail cannot rehearse, no plan is accepted
 - Jail (`jail.py`): an accepted plan's shell commands really run, under bubblewrap (read-only root, a private /tmp, the workdir the only writable path, no network, own PID/IPC namespaces, no capabilities) and strace. The trace becomes effects in the Vow's vocabulary, attempts included, with paths resolved through symlinks, `cd` and directory fds. The guard certifies its verdict over what really ran. Anything beyond ordinary work that the dry run did not predict is also `diverged`. No jail, no execution
 - Critic loop — Lean verifies Vow compliance during proposal, not after execution
 - Adversary ensemble — N independent curricula; guard must satisfy all
@@ -39,11 +40,11 @@
 - Full-execution certificates (Gap 2c)
 - Observation soundness (the critic proves the Vow against the effects `observation.py` reports, not against what a plan actually does). Default-deny scope effects (read/write_outside_workdir, exec_unvetted, network_unlisted) now catch all seven exploit shapes in `tests/test_observation_gaps.py`, up from 0 of 7; `CAUGHT_BY` there pins which effect catches each one. What remains open:
   - the vetted commands and allowed hosts in `observation.py` are a policy, and each deployment should set its own
-  - a dry run touches no filesystem, so it cannot see a symlink that leads out, a script's contents, a command inside `$(...)`, or a program's own file and socket calls. With the jail these are seen in the real run and judged there, and flagged `diverged` when unpredicted. Prevention for what the critic missed is the jail's containment, not the critic
+  - a dry run touches no filesystem, so it cannot see a symlink that leads out, a script's contents, a command inside `$(...)`, or a program's own file and socket calls. With rehearsal, the critic sees these before the plan runs for real. What a rehearsal still cannot promise is that the real run repeats it: a command that behaves differently on its second run, or on the real workdir rather than its copy, is caught only after the fact as `diverged`, under the jail's containment
   - the trace treats the dynamic loader's reads and libc's name-service files (`/etc/passwd` for `ls -l`) as the loader's doing. A plan that names them is caught from its arguments; a program that opens them itself is not, and any such program is `exec_unvetted` already
   - a program that detects it is being traced and behaves differently (an environmental trojan)
   - the jail needs bubblewrap's unprivileged user namespaces; where the host forbids them, nothing runs. Ubuntu 23.10 and later restrict them through AppArmor by default; a deployment allows them (`kernel.apparmor_restrict_unprivileged_userns=0`) or gives bwrap an AppArmor profile, and the jail probe names this when it is the cause
-  - the guard and co-signer share one observed effect set: the co-signer's verdict is independent, but its observation is not
+  - the co-signer re-derives a run's effects from its record, so a guard that misreports what the record shows is refused; but it trusts the record. Trace events forged before the guard saw them (a compromised executor or jail) are not caught without the co-signer re-executing the plan itself. An action with no run behind it carries no record, and there the guard's effect set is still the only observation
 - Routine actions (no class) are judged and refused when they carry a forbidden effect, but they get no certificate
 - A loaded ledger (`Ledger.load`) is only as trustworthy as the keys it is checked against. Keys stored in the file prove only that the file agrees with itself. Pass `pinned={signer: key_id}`, or doctor reports `keys_from_the_file`. HMAC signers have no public key to store and must be supplied
 - A toolchain that hangs or will not run has judged nothing. A timed-out or unrunnable coqc signs as `coqc-unavailable`, and a timed-out Lean critic accepts no plan and records no refusal. Neither counts as a layer that ran

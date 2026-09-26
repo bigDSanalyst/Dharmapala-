@@ -2,7 +2,8 @@
 """Verify a persisted Dharmapala ledger from the command line.
 
     python3 verify.py keys  LEDGER.json [--json]
-    python3 verify.py check LEDGER.json --pins PINS.json [--pin SIGNER=KEYID ...] [--json]
+    python3 verify.py check LEDGER.json --pins PINS.json [--pin SIGNER=KEYID ...]
+                            [--anchors DIR] [--json]
 
 `keys` prints each signer's key id as stored in the file. Record them when
 you first have reason to trust the ledger - out of band, not in the ledger -
@@ -12,6 +13,12 @@ only that the file agrees with itself, so `check` refuses to pass without them.
 `check` passes only when every signer in the file is pinned, the chains,
 signatures and checkpoints verify, and doctor reports nothing BLOCK or
 DEGRADED. LOOK and DRIFT findings are printed and do not fail the check.
+
+With --anchors DIR (anchoring.py's directory for this ledger), `check` also
+fails unless the anchor chain is intact, every export is the checkpoint its
+entry names, every anchored checkpoint is in this ledger and every checkpoint
+in it is anchored. An anchor not yet confirmed in Bitcoin is printed as LOOK
+and does not fail the check: it is recorded and waiting, which is not wrong.
 
 Exit codes:
     0  verified
@@ -47,7 +54,17 @@ def read_pins(files, pairs):
         k, v = p.split("=", 1); pins[k] = v
     return pins
 
-def check(path, pins):
+def check_anchors(ledger, anchor_dir):
+    """(failures, looks) for the anchors of a loaded, verified ledger."""
+    import anchoring
+    said = []
+    ok = anchoring.verify(Path(anchor_dir), ledger.checkpoints, say=said.append)
+    failures = [f"anchors: {l}" for l in said if l.startswith("error")]   # every failure says one
+    looks = [f"anchor #{e['seq']:04d} is {e['status']}, not yet confirmed in Bitcoin"
+             for e in anchoring.load_log(Path(anchor_dir) / "log.jsonl") if e.get("status") != "confirmed"]
+    return failures, looks
+
+def check(path, pins, anchors=None):
     """Returns (ok, lines, findings) - lines are the reasons, in order."""
     from doctor import observe_with_drift
     from ledger import KeyMismatch, Ledger
@@ -72,6 +89,14 @@ def check(path, pins):
     token, findings = observe_with_drift(L)
     failing = [f for f in findings if f.level in FAIL_LEVELS]
     for f in failing: lines.append(f"{f.level} {f.name}: {f.reason}")
+    if anchors is not None:
+        from doctor import Finding
+        if not (Path(anchors) / "log.jsonl").is_file():
+            lines.append(f"anchors: {anchors} holds no anchor log")
+        else:
+            failed, looks = check_anchors(L, anchors)
+            lines += failed
+            findings = list(findings) + [Finding("LOOK", "anchor", l, "") for l in looks]
     return not lines, lines, findings
 
 def main(argv=None):
@@ -80,6 +105,7 @@ def main(argv=None):
     ap.add_argument("ledger", type=Path)
     ap.add_argument("--pins", action="append", help="JSON file mapping signer -> key id")
     ap.add_argument("--pin", action="append", help="SIGNER=KEYID (repeatable)")
+    ap.add_argument("--anchors", type=Path, help="anchoring.py's directory for this ledger")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -93,7 +119,7 @@ def main(argv=None):
                     print(f"{sid:20s} {scheme:14s} {kid or '(no public key: shared secret)'}")
             return 0
         pins = read_pins(args.pins, args.pin)
-        ok, reasons, findings = check(args.ledger, pins)
+        ok, reasons, findings = check(args.ledger, pins, args.anchors)
     except (OSError, ValueError, KeyError, TypeError) as e:
         # A file this tool cannot read is not a ledger that failed: say which.
         msg = f"cannot verify {args.ledger}: {e.__class__.__name__}: {e}"

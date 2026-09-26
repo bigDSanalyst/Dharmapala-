@@ -45,7 +45,7 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import backends, jail, runs
+import answer_check, backends, jail, runs
 import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
 from decision import forbidden_of
@@ -318,6 +318,10 @@ def _report(gate, ledger, pol, workdir, args, finished, text):
     # The model's answer is its own claim. Beside it, what the record shows.
     print("\nwhat actually happened (from the run record, not the model):")
     for line in runs.account(gate.runs.this_run) or ["(no calls)"]: print("  " + line)
+    differ = answer_check.differences(text, gate.runs.this_run) if finished else []
+    if differ:
+        print("\nwhere the answer and the record differ:")
+        for line in differ: print("  " + line)
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
           + (f"  runs: {gate.runs.path}" if gate.runs.path else "")
           + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")

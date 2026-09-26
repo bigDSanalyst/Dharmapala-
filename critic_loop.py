@@ -5,18 +5,35 @@ from observation import observe
 from vow_lean import emit_vow_compliance
 from lake_critic import check, which_critic
 
+def evidence_of(calls, workdir, predicted):
+    """What a real run left behind, as data anyone can re-derive the effects
+    from: every call with its result (and, for jailed shell calls, the trace
+    events), the workdir, and what was predicted before it ran."""
+    return {"workdir": str(workdir), "predicted": sorted(predicted),
+            "calls": [[tool, kwargs, result] for tool, kwargs, result in calls]}
+
+def evidence_digest(evidence):
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
+
+def effects_from_evidence(evidence):
+    """The one derivation of a run's effects. The executor uses it, and so
+    does a co-signer checking the executor's account."""
+    calls = [(t, k, r) for t, k, r in evidence["calls"]]
+    effects = observe(calls, evidence["workdir"])
+    # Reading, writing and running inside the workdir are what any plan does;
+    # a real run that shows anything beyond them, unpredicted, has diverged.
+    if (effects - set(evidence["predicted"])) - {"read", "write", "exec"}: effects.add("diverged")
+    return effects
+
 def execute(plan, dry_effects, workdir, jail=False):
     """Run an accepted plan for real and observe what it did. Anything the
     real run shows that the dry run did not predict is also `diverged`, so a
-    Vow can forbid whatever the critic never saw."""
+    Vow can forbid whatever the critic never saw. Returns (effects, calls);
+    evidence_of(calls, workdir, dry_effects) is what a co-signer re-checks."""
     real = Sandbox(workdir, jail=jail)
     for tool, kwargs in plan:
         getattr(real, tool)(**kwargs)
-    effects = observe(real.calls, real.workdir)
-    # Reading, writing and running inside the workdir are what any plan does;
-    # a real run that shows anything beyond them, unpredicted, has diverged.
-    if (effects - set(dry_effects)) - {"read", "write", "exec"}: effects.add("diverged")
-    return effects, real.calls
+    return effects_from_evidence(evidence_of(real.calls, real.workdir, dry_effects)), real.calls
 
 def rehearse(plan, dry_effects, workdir=None):
     """Run the plan for real, in the jail, against a throwaway copy of the

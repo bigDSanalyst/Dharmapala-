@@ -17,7 +17,7 @@ from agent import Agent
 from vrf import GuardNonce, Counterparty
 from lake_critic import which_critic, critic_status
 from compression import compress, verify_archive
-from critic_loop import execute
+from critic_loop import execute, evidence_of
 import jail
 
 VOW_SOURCE = """
@@ -96,11 +96,13 @@ def main():
             verdicts[epoch] = "ABSTAINED"; continue
         # Shell commands really run only inside the jail; without one they are
         # recorded and not run, and the jail layer below reports it.
-        observed, _ = execute(plan, effects, os.path.join(tmpdir, f"sb_{epoch}"), jail=jail_ok)
+        workdir = os.path.join(tmpdir, f"sb_{epoch}")
+        observed, calls = execute(plan, effects, workdir, jail=jail_ok)
         executed.append(observed)
         print(f"    executed plan: {len(plan)} call(s) -> observed={sorted(observed)}")
         action = Action(id=f"a{epoch}", verb="execute", domain="action", payload={})
         action._observed_effects = observed
+        action._evidence = evidence_of(calls, workdir, effects)   # the co-signer re-derives from this
         inputs = {"butterflies": [(100 + epoch, 200, 17)]}
         verdict = guard.engage(action, vow, beta, tb, f"c{epoch}", inputs,
                                 engine_run, bp, bh)

@@ -24,12 +24,17 @@ def verdict_of(effects, forbidden):
 class Decision:
     effects: tuple; forbidden: tuple; verdict: str
     action_digest: str; vow_hash: str
+    evidence_digest: str = ""       # what the effects were read from, when there is a record of it
     @classmethod
     def of(cls, action, vow):
         effects = tuple(sorted(action.effects()))
         forbidden = forbidden_of(vow)
+        ev = getattr(action, "_evidence", None)
+        if ev is not None:
+            from critic_loop import evidence_digest
+            ev = evidence_digest(ev)
         return cls(effects, forbidden, verdict_of(effects, forbidden),
-                   action.canonical_digest(), vow.hash())
+                   action.canonical_digest(), vow.hash(), ev or "")
     def coq_preamble(self):
         return ["Require Import List. Import ListNotations.",
                 "Inductive Effect := " + " | ".join(_ctor(e) for e in EFFECTS) + ".",

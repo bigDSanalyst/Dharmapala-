@@ -66,6 +66,7 @@ class Attestation:
     # What was decided, and about which action under which Vow. Signed, so an
     # attestation cannot be moved to another record (ledger.verify_integrity).
     action_digest: str = ""; vow_hash: str = ""; verdict: str = ""
+    evidence_digest: str = ""       # the run record the co-signer re-derived the effects from
     signature: str = ""
     @property
     def signer_id(self): return self.co_signer_id
@@ -74,7 +75,7 @@ class Attestation:
                 f"{self.epoch}|{self.inputs_hash}|{self.certificate_hash}|"
                 f"{self.output_hash}|{self.co_signer_id}|"
                 f"{self.certificate_status}|{self.action_digest}|"
-                f"{self.vow_hash}|{self.verdict}").encode()
+                f"{self.vow_hash}|{self.verdict}|{self.evidence_digest}").encode()
     def attestation_hash(self):
         return hashlib.sha256(self.payload()).hexdigest()
 
@@ -108,13 +109,14 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
                        output_hash=_hash(outputs), co_signer_id=co_signer_id,
                        action_digest=decision.action_digest if decision else "",
                        vow_hash=decision.vow_hash if decision else "",
-                       verdict=decision.verdict if decision else "")
+                       verdict=decision.verdict if decision else "",
+                       evidence_digest=decision.evidence_digest if decision else "")
 
 class CoSigner:
     def __init__(self, signer, require_coqc=False):
         self.id = signer.id; self._signer = signer
         self.require_coqc = require_coqc; self.notes = []
-    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None):
+    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None):
         self.notes = []
         if proposal.co_signer_id != self.id:
             raise RefusedToSign("proposal addressed to a different co-signer")
@@ -136,11 +138,25 @@ class CoSigner:
             # Decide independently, then check the proposal says the same.
             from decision import verdict_of
             mine = verdict_of(decision.effects, decision.forbidden)
-            if (mine, decision.action_digest, decision.vow_hash) != \
-                    (proposal.verdict, proposal.action_digest, proposal.vow_hash):
+            if (mine, decision.action_digest, decision.vow_hash, decision.evidence_digest) != \
+                    (proposal.verdict, proposal.action_digest, proposal.vow_hash, proposal.evidence_digest):
                 self.notes.append("decision: MISMATCH")
                 raise RefusedToSign(f"decision mismatch: proposal={proposal.verdict} cosigner={mine}")
             self.notes.append("decision: match")
+            if decision.evidence_digest:
+                # Observe for itself: re-derive the effects from the run record
+                # rather than taking the guard's account of them.
+                from critic_loop import effects_from_evidence, evidence_digest
+                if evidence is None:
+                    raise RefusedToSign("decision cites a run record the co-signer was not shown")
+                if evidence_digest(evidence) != decision.evidence_digest:
+                    self.notes.append("evidence: MISMATCH")
+                    raise RefusedToSign("run record does not match the digest the decision cites")
+                seen = tuple(sorted(effects_from_evidence(evidence)))
+                if seen != decision.effects:
+                    self.notes.append("effects: MISMATCH")
+                    raise RefusedToSign(f"co-signer observed {list(seen)} where the guard reports {list(decision.effects)}")
+                self.notes.append("effects: re-derived, match")
         elif proposal.verdict or proposal.action_digest:
             raise RefusedToSign("proposal carries a decision the co-signer was not shown")
         # Check the certificate this co-signer builds, not the file it was

@@ -1,0 +1,24 @@
+{
+  "format": "dharmapala-policy/v1",
+  "sensitive_paths": [
+    "^/etc/(passwd|shadow|gshadow|sudoers)$",
+    "^/etc/sudoers\\.d(/|$)",
+    "^/etc/ssh(/|$)",
+    "^/root(/|$)",
+    "(^|/)\\.ssh(/|$)",
+    "(^|/)\\.gnupg(/|$)",
+    "(^|/)\\.aws(/|$)",
+    "(^|/)\\.config/gcloud(/|$)",
+    "(^|/)\\.kube(/|$)",
+    "(^|/)\\.docker/config\\.json$",
+    "(^|/)\\.netrc$",
+    "(^|/)\\.git-credentials$",
+    "(^|/)\\.env(\\.[^/]*)?$",
+    "\\.(pem|key|p12|pfx)$",
+    "^/proc/[^/]+/environ$"
+  ],
+  "vetted_commands": ["cat", "date", "echo", "grep", "head", "ls", "pwd", "sort", "tail", "true", "uniq", "wc"],
+  "allowed_hosts": [],
+  "exfil_hosts": ["evil.example.com", "pastebin.com", "transfer.sh"],
+  "hoard_threshold": 3
+}

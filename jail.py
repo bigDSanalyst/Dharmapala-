@@ -18,7 +18,8 @@
 import os, re, shutil, subprocess, tempfile
 from dataclasses import dataclass, field
 
-from observation import (FILE_READERS, NETWORK_COMMANDS, PACKAGE_COMMANDS, VETTED_COMMANDS,
+import policy as policy_mod
+from observation import (FILE_READERS, NETWORK_COMMANDS, PACKAGE_COMMANDS,
                          DESTRUCT_CMDS, DOMINATE_CMDS, _touch_host, _touch_path, inside, normalise)
 
 TIMEOUT = 30.0
@@ -188,24 +189,26 @@ def parse(per_pid, cmd):
                 events.append(("kill", args.split(",")[0].strip(), ok))
     return events
 
-def effects_of(events, workdir):
-    """What the trace shows the command did or tried to do, as Vow effects."""
+def effects_of(events, workdir, policy=None):
+    """What the trace shows the command did or tried to do, as Vow effects,
+    under `policy` (policy.py; None for the default)."""
+    pol = policy_mod.of(policy)
     effects = {"exec"}
     for kind, detail, ok in events:
         if kind == "exec":
             name = os.path.basename(detail[0]) if detail else "?"
-            if name not in VETTED_COMMANDS: effects.add("exec_unvetted")
+            if name not in pol.vetted_commands: effects.add("exec_unvetted")
             line = " ".join(detail)
             if DESTRUCT_CMDS.search(line): effects.add("destruct")
             if DOMINATE_CMDS.search(line): effects.add("dominate")
             if name in NETWORK_COMMANDS:
                 effects.add("network_access")
                 for a in detail[1:]:
-                    if not a.startswith("-") and ("://" in a or "." in a): _touch_host(a, effects)
+                    if not a.startswith("-") and ("://" in a or "." in a): _touch_host(a, effects, pol)
             if name in PACKAGE_COMMANDS: effects.update({"network_access", "network_unlisted"})
             if name in FILE_READERS:        # what the command was asked to read, by name
                 ops = [a for a in detail[1:] if not a.startswith("-")]
-                for f in (ops[1:] if name == "grep" else ops): _touch_path(f, workdir, effects, write=False)
+                for f in (ops[1:] if name == "grep" else ops): _touch_path(f, workdir, effects, False, pol)
         elif kind == "read":
             p = normalise(detail, workdir)
             if not inside(p, workdir) and p.startswith(LOADER_READS): continue
@@ -213,13 +216,13 @@ def effects_of(events, workdir):
             # namespace that shows only the jail's processes. /proc/sys and
             # the rest of /proc stay visible as reads outside the workdir.
             if re.match(r"^/proc/\d+/", p): continue
-            _touch_path(detail, workdir, effects, write=False)
+            _touch_path(detail, workdir, effects, False, pol)
         elif kind == "write":
-            _touch_path(detail, workdir, effects, write=True)
+            _touch_path(detail, workdir, effects, True, pol)
         elif kind == "unlink":
-            _touch_path(detail, workdir, effects, write=True)
+            _touch_path(detail, workdir, effects, True, pol)
         elif kind == "rename":
-            for path in detail: _touch_path(path, workdir, effects, write=True)
+            for path in detail: _touch_path(path, workdir, effects, True, pol)
         elif kind == "connect":
             effects.update({"network_access", "network_unlisted"})
         elif kind == "kill":

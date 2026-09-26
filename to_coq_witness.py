@@ -67,6 +67,7 @@ class Attestation:
     # attestation cannot be moved to another record (ledger.verify_integrity).
     action_digest: str = ""; vow_hash: str = ""; verdict: str = ""
     evidence_digest: str = ""       # the run record the co-signer re-derived the effects from
+    policy_hash: str = ""           # the policy those effects were judged under
     signature: str = ""
     @property
     def signer_id(self): return self.co_signer_id
@@ -75,7 +76,8 @@ class Attestation:
                 f"{self.epoch}|{self.inputs_hash}|{self.certificate_hash}|"
                 f"{self.output_hash}|{self.co_signer_id}|"
                 f"{self.certificate_status}|{self.action_digest}|"
-                f"{self.vow_hash}|{self.verdict}|{self.evidence_digest}").encode()
+                f"{self.vow_hash}|{self.verdict}|{self.evidence_digest}"
+                + (f"|policy:{self.policy_hash}" if self.policy_hash else "")).encode()
     def attestation_hash(self):
         return hashlib.sha256(self.payload()).hexdigest()
 
@@ -110,15 +112,20 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
                        action_digest=decision.action_digest if decision else "",
                        vow_hash=decision.vow_hash if decision else "",
                        verdict=decision.verdict if decision else "",
-                       evidence_digest=decision.evidence_digest if decision else "")
+                       evidence_digest=decision.evidence_digest if decision else "",
+                       policy_hash=decision.policy_hash if decision else "")
 
 class CoSigner:
-    def __init__(self, signer, require_coqc=False, reexecute=False):
+    def __init__(self, signer, require_coqc=False, reexecute=False, policy=None):
         # reexecute: a jailed run is not taken on its trace's word. The
         # co-signer snapshots the workdir before the run and runs the plan
         # again itself against that snapshot (replay.py).
         self.id = signer.id; self._signer = signer
         self.require_coqc = require_coqc; self.reexecute = reexecute; self.notes = []
+        # The one policy this co-signer vouches under: a decision judged under
+        # any other is refused, however well its effects check out.
+        import policy as policy_mod
+        self.policy = policy_mod.of(policy)
         self._snapshots = set()
     def snapshot(self, workdir):
         """Copy the workdir before the run: what a replay will start from."""
@@ -151,8 +158,9 @@ class CoSigner:
             # Decide independently, then check the proposal says the same.
             from decision import verdict_of
             mine = verdict_of(decision.effects, decision.forbidden)
-            if (mine, decision.action_digest, decision.vow_hash, decision.evidence_digest) != \
-                    (proposal.verdict, proposal.action_digest, proposal.vow_hash, proposal.evidence_digest):
+            if (mine, decision.action_digest, decision.vow_hash, decision.evidence_digest, decision.policy_hash) != \
+                    (proposal.verdict, proposal.action_digest, proposal.vow_hash, proposal.evidence_digest,
+                     proposal.policy_hash):
                 self.notes.append("decision: MISMATCH")
                 raise RefusedToSign(f"decision mismatch: proposal={proposal.verdict} cosigner={mine}")
             self.notes.append("decision: match")
@@ -165,6 +173,17 @@ class CoSigner:
                 if evidence_digest(evidence) != decision.evidence_digest:
                     self.notes.append("evidence: MISMATCH")
                     raise RefusedToSign("run record does not match the digest the decision cites")
+                import policy as policy_mod
+                try: judged_under = policy_mod.of(evidence.get("policy")).hash()
+                except policy_mod.PolicyError as e:
+                    raise RefusedToSign(f"the run record's policy is not a policy: {e}")
+                if judged_under != decision.policy_hash:
+                    raise RefusedToSign("the decision names a policy other than the run record's")
+                if judged_under != self.policy.hash():
+                    self.notes.append("policy: NOT ACCEPTED")
+                    raise RefusedToSign(f"judged under policy {judged_under[:12]}, which this co-signer "
+                                        f"does not vouch under (it holds {self.policy.hash()[:12]})")
+                self.notes.append("policy: accepted")
                 # Read the raw trace with the co-signer's own parser, not the
                 # events the guard's side parsed from it (witness.py).
                 import witness

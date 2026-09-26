@@ -1,15 +1,18 @@
 
 import hashlib, json, pathlib, shutil, tempfile
 from tools import Sandbox
+import policy as policy_mod
 from observation import observe
 from vow_lean import emit_vow_compliance
 from lake_critic import check, which_critic
 
-def evidence_of(calls, workdir, predicted):
+def evidence_of(calls, workdir, predicted, policy=None):
     """What a real run left behind, as data anyone can re-derive the effects
     from: every call with its result (and, for jailed shell calls, the trace
-    events), the workdir, and what was predicted before it ran."""
+    events), the workdir, what was predicted before it ran, and the policy
+    (policy.py) that gives the effects their meaning."""
     return {"workdir": str(workdir), "predicted": sorted(predicted),
+            "policy": policy_mod.of(policy).to_dict(),
             "calls": [[tool, kwargs, result] for tool, kwargs, result in calls]}
 
 def evidence_digest(evidence):
@@ -24,13 +27,13 @@ def effects_from_evidence(evidence, reread=None):
         if reread is not None and t == "shell" and isinstance(r, dict) and r.get("jailed"):
             r = dict(r, events=reread(r, k.get("cmd", "")))
         calls.append((t, k, r))
-    effects = observe(calls, evidence["workdir"])
+    effects = observe(calls, evidence["workdir"], evidence.get("policy"))
     # Reading, writing and running inside the workdir are what any plan does;
     # a real run that shows anything beyond them, unpredicted, has diverged.
     if (effects - set(evidence["predicted"])) - {"read", "write", "exec"}: effects.add("diverged")
     return effects
 
-def execute(plan, dry_effects, workdir, jail=False):
+def execute(plan, dry_effects, workdir, jail=False, policy=None):
     """Run an accepted plan for real and observe what it did. Anything the
     real run shows that the dry run did not predict is also `diverged`, so a
     Vow can forbid whatever the critic never saw. Returns (effects, calls);
@@ -38,9 +41,9 @@ def execute(plan, dry_effects, workdir, jail=False):
     real = Sandbox(workdir, jail=jail)
     for tool, kwargs in plan:
         getattr(real, tool)(**kwargs)
-    return effects_from_evidence(evidence_of(real.calls, real.workdir, dry_effects)), real.calls
+    return effects_from_evidence(evidence_of(real.calls, real.workdir, dry_effects, policy)), real.calls
 
-def rehearse(plan, dry_effects, workdir=None):
+def rehearse(plan, dry_effects, workdir=None, policy=None):
     """Run the plan for real, in the jail, against a throwaway copy of the
     workdir it is meant for, and return what it did (None if the jail could
     not run it). The copy is what makes a rehearsal worth having: a script
@@ -52,7 +55,7 @@ def rehearse(plan, dry_effects, workdir=None):
             shutil.copytree(workdir, copy, symlinks=True)
         else:
             copy.mkdir()
-        effects, calls = execute(plan, dry_effects, str(copy), jail=True)
+        effects, calls = execute(plan, dry_effects, str(copy), jail=True, policy=policy)
         if any(tool == "shell" and not result.get("jailed") for tool, _, result in calls):
             return None
         effects.discard("diverged")     # the rehearsal is the prediction, not a deviation from one
@@ -62,13 +65,14 @@ def rehearse(plan, dry_effects, workdir=None):
 
 class CriticLoop:
     def __init__(self, agent, vow, lake_root='/content/dharma/lean',
-                 max_retries=3, verbose=True, guard=None, rehearse=False):
+                 max_retries=3, verbose=True, guard=None, rehearse=False, policy=None):
         # rehearse=True: before a plan is accepted it runs for real in the
         # jail against a throwaway copy of its workdir, and the critic judges
         # what that run did as well as what the dry run predicted.
         self.agent = agent; self.vow = vow; self.lake_root = lake_root
         self.max_retries = max_retries; self.verbose = verbose
         self.guard = guard; self.rehearse = rehearse
+        self.policy = policy_mod.of(policy)     # what the effects mean here (policy.py)
         self.attempts = []
         self.unchecked = 0      # attempts the critic could not judge at all
     def propose_and_verify(self, goal, workdir=None):
@@ -77,10 +81,10 @@ class CriticLoop:
             dry = Sandbox(tempfile.mkdtemp(), dry_run=True)
             self.agent.sandbox = dry
             self.agent.act(goal, context=context)
-            effects = observe(dry.calls, dry.workdir)
+            effects = observe(dry.calls, dry.workdir, self.policy)
             rehearsed = None
             if self.rehearse:
-                rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir)
+                rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir, self.policy)
                 if rehearsed is None:
                     # Asked to rehearse and could not: the plan is not judged.
                     self.unchecked += 1

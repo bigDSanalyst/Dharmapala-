@@ -28,6 +28,15 @@ def effects(cmd, w=None):
     w = w or tempfile.mkdtemp()
     return jail.effects_of(jail.run(cmd, w).events, w)
 
+def explain(cmd, w=None):
+    """The events behind an effect set, for a failure message: CI runners
+    differ from dev machines in what programs open (run 18)."""
+    from observation import inside, normalise
+    w = w or tempfile.mkdtemp()
+    return [(k, d) for k, d, ok in jail.run(cmd, w).events
+            if k in ("read", "write", "unlink") and not inside(normalise(d, w), w)
+            and not normalise(d, w).startswith(jail.LOADER_READS)]
+
 # --- containment ----------------------------------------------------------------------------
 
 @needs_jail
@@ -89,6 +98,8 @@ def test_what_it_tried_is_an_effect_even_when_refused(cmd, expected):
     ("ln -s /etc outside; cat outside/shadow", {"read_sensitive_path"}),
     # a cd, then a relative name
     ("cd /etc && cat shadow", {"read_sensitive_path"}),
+    # a symlink whose open fails: no file is reported, the link is resolved after
+    ("ln -s /root/.ssh keys; cat keys/id_missing 2>/dev/null; true", {"read_sensitive_path"}),
     # a socket opened by the program itself: no argument names a host
     ("python3 -c \"import socket; socket.create_connection(('1.1.1.1', 53), timeout=2)\" 2>/dev/null; true",
      {"network_access", "network_unlisted"}),
@@ -102,7 +113,7 @@ def test_what_no_dry_run_can_see(cmd, expected):
 @pytest.mark.parametrize("cmd", ["ls -la", "echo hello > note.txt; cat note.txt | wc -l",
                                  "grep -r hello . ; true", "date; pwd", "sort note.txt 2>/dev/null | uniq; true"])
 def test_ordinary_work_is_ordinary(cmd):
-    assert effects(cmd) <= ORDINARY
+    assert effects(cmd) <= ORDINARY, explain(cmd)
 
 # --- the executor ---------------------------------------------------------------------------------
 
@@ -162,3 +173,14 @@ def test_a_restricted_host_is_named_as_the_cause(monkeypatch, err, hinted):
     ok, why = jail.available()
     assert not ok and err in why
     assert ("apparmor_restrict_unprivileged_userns" in why) == hinted
+
+
+@needs_jail
+def test_the_host_environment_does_not_reach_the_jail(tmp_path, monkeypatch):
+    """The parent's environment can hold tokens, and loader variables change
+    what every program opens (LD_LIBRARY_PATH on GitHub's runners, run 18)."""
+    monkeypatch.setenv("DHARMA_TEST_SECRET", "s3cret")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hostedtoolcache/nowhere/lib")
+    r = jail.run('echo "[$DHARMA_TEST_SECRET]" > env.txt; date', str(tmp_path))
+    assert (tmp_path / "env.txt").read_text().strip() == "[]"
+    assert jail.effects_of(r.events, str(tmp_path)) <= ORDINARY

@@ -71,7 +71,12 @@ def _bwrap(workdir):
     w = os.path.realpath(workdir)
     return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", w, w, "--chdir", w,
             "--dev", "/dev", "--proc", "/proc", "--unshare-all", "--die-with-parent",
-            "--new-session", "--cap-drop", "ALL", "--setenv", "HOME", w]
+            "--new-session", "--cap-drop", "ALL",
+            # A clean environment: the host's may hold tokens, and its loader
+            # variables (LD_LIBRARY_PATH on GitHub's runners) change what every
+            # program opens. Only these three go in.
+            "--clearenv", "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--setenv", "HOME", w, "--setenv", "LANG", "C.UTF-8"]
 
 def run(cmd, workdir, timeout=None, _probe=False):
     """Run `cmd` with sh inside the jail, traced. Raises JailUnavailable
@@ -116,9 +121,12 @@ def _where(args, name, ret_rest, ok, nth=0):
     if ok:
         m = _RESOLVED.match(ret_rest.strip())
         if m: return m.group(1)
-    if name.startswith("/"): return name
     dirs = _DIRFD.findall(args)
-    return os.path.join(dirs[nth], name) if len(dirs) > nth else name
+    path = name if name.startswith("/") else (os.path.join(dirs[nth], name) if len(dirs) > nth else name)
+    # A failed open reports no file. Resolve what can be resolved after the
+    # run: a symlink the command left in the workdir (ln -s /etc outside) is
+    # still there, and / is the same inside the jail as out.
+    return os.path.realpath(path) if path.startswith("/") else path
 
 def _calls(text):
     for line in text.splitlines():

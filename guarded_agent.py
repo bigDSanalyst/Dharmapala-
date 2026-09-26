@@ -274,10 +274,36 @@ def main(argv=None):
         print("no API credentials: set ANTHROPIC_API_KEY or run `ant auth login`", file=sys.stderr); return 1
     return _report(gate, ledger, pol, workdir, args, finished, text)
 
+def tool_calls_in_text(text):
+    """Tool calls the model wrote into its answer as text instead of making
+    them: a <tool_call> tag, or a JSON object naming one of the tools with
+    its arguments. They were never run, and nothing here runs them; they are
+    only named, so an answer that looks like work done is not taken for it.
+    Returns [(tool name or "?", arguments or None)]."""
+    found, dec, i = [], json.JSONDecoder(), 0
+    while True:
+        i = text.find("{", i)
+        if i < 0: break
+        try: obj, end = dec.raw_decode(text, i)
+        except ValueError: i += 1; continue
+        if isinstance(obj, dict) and obj.get("name") in ARGS and \
+                any(k in obj for k in ("arguments", "parameters", "input")):
+            args = next(obj[k] for k in ("arguments", "parameters", "input") if k in obj)
+            found.append((obj["name"], args if isinstance(args, dict) else None))
+        i = end
+    if not found and ("<tool_call>" in text or "</tool_call>" in text):
+        found.append(("?", None))
+    return found
+
 def _report(gate, ledger, pol, workdir, args, finished, text):
     for name, a, outcome, detail in gate.log:
         print(f"  {outcome:16s} {name} {json.dumps(a)[:100]}")
     print(text)
+    written = tool_calls_in_text(text)
+    if written:
+        names = ", ".join(n if a is None else f"{n} {runs._what(n, a)}" for n, a in written)
+        print(f"\nnote: the model wrote {len(written)} tool call(s) as text instead of making them "
+              f"({names}); they were not run")
     # The model's answer is its own claim. Beside it, what the record shows.
     print("\nwhat actually happened (from the run record, not the model):")
     for line in runs.account(gate.runs.entries) or ["(no calls)"]: print("  " + line)

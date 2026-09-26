@@ -22,5 +22,22 @@ and exits 1: a layer that did not run is not a layer that passed.
 | Lean critic | `lean` on PATH, version in `lean/lean-toolchain` | the critic falls back to a Python check |
 | Coq certificates | `coqc` (`apt install coq`) | attestations are signed as `coqc-unavailable` |
 | ML-DSA-65 signatures | `pip install dilithium-py` | signers fall back to HMAC, which anyone able to verify can forge |
+| Jail (real execution, traced) | `bwrap` and `strace` (`apt install bubblewrap strace`) | shell commands are recorded and never run |
 
-CI installs all three, so a green CI run means all three ran.
+CI installs all four, so a green CI run means all four ran.
+
+## Verifying a ledger someone gave you
+
+    python3 verify.py keys  ledger.json --json > pins.json   # once, when you have reason to trust it
+    python3 verify.py check ledger.json --pins pins.json     # every time after
+
+`check` exits 0 only when:
+- every signer's key is pinned;
+- the chains, signatures and checkpoints verify;
+- doctor finds nothing BLOCK or DEGRADED.
+
+Otherwise it exits 1 and names why. Keep the pins somewhere other than the
+ledger: keys read from the file itself show only that the file agrees with
+itself. A ledger signed with HMAC cannot be checked outside the process that
+holds the key.
+

@@ -8,7 +8,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: sudo apt-get update && sudo apt-get install -y gcc coq zstd
+      - run: sudo apt-get update && sudo apt-get install -y gcc coq zstd bubblewrap strace
       # Lean comes from the release named in lean/lean-toolchain and is checked
       # against a pinned hash, so bumping the toolchain means updating the hash.
       - name: Install Lean
@@ -21,8 +21,15 @@ jobs:
           mkdir -p "$HOME/lean" && tar --zstd -xf lean.tar.zst -C "$HOME/lean" && rm lean.tar.zst
           echo "$HOME/lean/lean-${v}-linux/bin" >> "$GITHUB_PATH"
       - run: pip install -r requirements.txt pytest
+      # The jail needs unprivileged user namespaces. Ubuntu 24.04 restricts them
+      # through AppArmor, and bwrap then fails with "loopback: Failed RTM_NEWADDR:
+      # Operation not permitted" (run 17). This runner is thrown away after the job.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # A jail that cannot run here fails the suite instead of skipping it.
       - run: pytest -q
-      # The demo exits 1 unless Lean, Coq and ML-DSA-65 all actually ran, so a
-      # green run here means every layer ran, not just that nothing crashed.
+        env:
+          DHARMA_REQUIRE_JAIL: "1"
+      # The demo exits 1 unless Lean, Coq, the jail and ML-DSA-65 all actually
+      # ran, so a green run here means every layer ran, not just that nothing crashed.
       - name: Demo passes with every layer running
         run: python3 run_demo.py

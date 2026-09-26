@@ -2,8 +2,11 @@
 import pathlib
 
 class Sandbox:
-    def __init__(self, workdir, dry_run=False):
-        self.workdir = pathlib.Path(workdir); self.dry_run = dry_run
+    def __init__(self, workdir, dry_run=False, jail=False):
+        # jail=True: shell commands really run, inside jail.py's jail, traced.
+        # Otherwise they are recorded and never run, as before. Either way a
+        # dry run runs nothing.
+        self.workdir = pathlib.Path(workdir); self.dry_run = dry_run; self.jail = jail
         if not dry_run: self.workdir.mkdir(parents=True, exist_ok=True)
         self.calls = []
     def _record(self, tool, kwargs, result):
@@ -41,5 +44,15 @@ class Sandbox:
         self._record("http_get", kwargs, r); return r
     def shell(self, cmd):
         kwargs = {"cmd": cmd}
-        r = {"ok": True, "cmd": cmd, "blocked": True}
+        if self.jail and not self.dry_run:
+            import jail
+            try:
+                ex = jail.run(cmd, str(self.workdir))
+                r = {"ok": ex.returncode == 0 and not ex.timed_out, "cmd": cmd, "jailed": True,
+                     "returncode": ex.returncode, "stdout": ex.stdout[:2000],
+                     "timed_out": ex.timed_out, "events": ex.events}
+            except jail.JailUnavailable as e:
+                r = {"ok": False, "cmd": cmd, "jailed": False, "error": f"not run: {e}"}
+        else:
+            r = {"ok": True, "cmd": cmd, "blocked": True}
         self._record("shell", kwargs, r); return r

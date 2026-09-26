@@ -29,10 +29,12 @@ def test_a_missing_layer_is_never_a_pass(without, tool):
 def test_lawful_goals_are_judged(result):
     assert result["verdicts"][0] == "LAWFUL"
     assert result["verdicts"][1] == "LAWFUL"
+    assert result["verdicts"][5] == "LAWFUL"         # `ls -la`, really run in the jail
 
 def test_forbidden_goals_are_refused_and_recorded(result):
     assert [result["verdicts"][e] for e in (2, 3, 4)] == ["ABSTAINED"] * 3
-    classes = [a.class_id for a in result["ledger"].audits]
+    # compression at the end of the demo may have moved them to the archive
+    classes = [a.class_id for a in list(result["archive"].audits) + list(result["ledger"].audits)]
     assert classes == ["critic:exfiltrate", "critic:hoard", "critic:dominate"]
 
 def test_no_forbidden_effect_is_executed(result):
@@ -41,7 +43,7 @@ def test_no_forbidden_effect_is_executed(result):
     assert not any(e & forbidden for e in result["executed"])
 
 def test_inaction_earns_no_merit(result):
-    assert result["guard"].punya == 4.0
+    assert result["guard"].punya == 6.0              # three lawful effectful actions, 2.0 each
 
 def test_ledger_and_transcripts_verify(result):
     assert result["ledger"].verify_integrity()

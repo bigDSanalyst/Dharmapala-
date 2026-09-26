@@ -1,9 +1,22 @@
 
-import hashlib, json, tempfile
+import hashlib, json, pathlib, tempfile
 from tools import Sandbox
 from observation import observe
 from vow_lean import emit_vow_compliance
 from lake_critic import check, which_critic
+
+def execute(plan, dry_effects, workdir, jail=False):
+    """Run an accepted plan for real and observe what it did. Anything the
+    real run shows that the dry run did not predict is also `diverged`, so a
+    Vow can forbid whatever the critic never saw."""
+    real = Sandbox(workdir, jail=jail)
+    for tool, kwargs in plan:
+        getattr(real, tool)(**kwargs)
+    effects = observe(real.calls, real.workdir)
+    # Reading, writing and running inside the workdir are what any plan does;
+    # a real run that shows anything beyond them, unpredicted, has diverged.
+    if (effects - set(dry_effects)) - {"read", "write", "exec"}: effects.add("diverged")
+    return effects, real.calls
 
 class CriticLoop:
     def __init__(self, agent, vow, lake_root='/content/dharma/lean',

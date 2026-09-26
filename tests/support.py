@@ -8,7 +8,7 @@ import lake_critic  # noqa: E402
 
 # The layer each toolchain provides, as run_demo.py names it.
 LAYER = {"lean": "lean critic", "coqc": "coq certificates",
-         "dilithium-py": "ml-dsa-65 signatures"}
+         "dilithium-py": "ml-dsa-65 signatures", "jail": "jail (real execution, traced)"}
 
 def toolchain_missing():
     missing = []
@@ -16,4 +16,6 @@ def toolchain_missing():
     if shutil.which("coqc") is None: missing.append("coqc")
     try: import dilithium_py.ml_dsa  # noqa: F401
     except ImportError: missing.append("dilithium-py")
+    import jail
+    if not jail.available()[0]: missing.append("jail")
     return missing

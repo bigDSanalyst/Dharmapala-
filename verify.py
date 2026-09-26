@@ -3,7 +3,7 @@
 
     python3 verify.py keys  LEDGER.json [--json]
     python3 verify.py check LEDGER.json --pins PINS.json [--pin SIGNER=KEYID ...]
-                            [--anchors DIR] [--json]
+                            [--anchors DIR] [--runs FILE] [--json]
 
 `keys` prints each signer's key id as stored in the file. Record them when
 you first have reason to trust the ledger - out of band, not in the ledger -
@@ -19,6 +19,11 @@ fails unless the anchor chain is intact, every export is the checkpoint its
 entry names, every anchored checkpoint is in this ledger and every checkpoint
 in it is anchored. An anchor not yet confirmed in Bitcoin is printed as LOOK
 and does not fail the check: it is recorded and waiting, which is not wrong.
+
+With --runs FILE (a guarded agent's run records, runs.py), `check` also fails
+unless their chain is intact, every stored record hashes to the digest its
+entry names, every entry that ran is one this ledger signed with the verdict
+it says, and every run the ledger signed has an entry.
 
 Exit codes:
     0  verified
@@ -64,7 +69,7 @@ def check_anchors(ledger, anchor_dir):
              for e in anchoring.load_log(Path(anchor_dir) / "log.jsonl") if e.get("status") != "confirmed"]
     return failures, looks
 
-def check(path, pins, anchors=None):
+def check(path, pins, anchors=None, runs_path=None):
     """Returns (ok, lines, findings) - lines are the reasons, in order."""
     from doctor import observe_with_drift
     from ledger import KeyMismatch, Ledger
@@ -97,6 +102,10 @@ def check(path, pins, anchors=None):
             failed, looks = check_anchors(L, anchors)
             lines += failed
             findings = list(findings) + [Finding("LOOK", "anchor", l, "") for l in looks]
+    if runs_path is not None:
+        import runs
+        try: lines += [f"runs: {p}" for p in runs.verify(runs.load(runs_path), L)]
+        except runs.RunsError as e: lines.append(f"runs: {e}")
     return not lines, lines, findings
 
 def main(argv=None):
@@ -106,6 +115,7 @@ def main(argv=None):
     ap.add_argument("--pins", action="append", help="JSON file mapping signer -> key id")
     ap.add_argument("--pin", action="append", help="SIGNER=KEYID (repeatable)")
     ap.add_argument("--anchors", type=Path, help="anchoring.py's directory for this ledger")
+    ap.add_argument("--runs", type=Path, help="a guarded agent's run records for this ledger (runs.py)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -119,7 +129,7 @@ def main(argv=None):
                     print(f"{sid:20s} {scheme:14s} {kid or '(no public key: shared secret)'}")
             return 0
         pins = read_pins(args.pins, args.pin)
-        ok, reasons, findings = check(args.ledger, pins, args.anchors)
+        ok, reasons, findings = check(args.ledger, pins, args.anchors, args.runs)
     except (OSError, ValueError, KeyError, TypeError) as e:
         # A file this tool cannot read is not a ledger that failed: say which.
         msg = f"cannot verify {args.ledger}: {e.__class__.__name__}: {e}"

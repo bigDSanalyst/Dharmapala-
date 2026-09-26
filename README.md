@@ -57,6 +57,28 @@ The default Vow forbids:
 `--vow FILE` replaces it. Credentials come from `ANTHROPIC_API_KEY` or
 `ant auth login`.
 
+### What actually happened
+
+After the model's answer, the agent prints an account of every call, built
+from the run records and never from the model:
+
+    what actually happened (from the run record, not the model):
+      lawful    read notes.txt -> "alpha\nbeta\n"
+      lawful    wrote notes.txt <- "${response.body}gamma" (21 bytes)
+      refused   file_read .env: refused before running: ... read_sensitive_path
+
+That example is from the first live run. A 7B model wrote a placeholder into
+the file and then reported the file's intended contents, and in a second run
+it said "no credentials here" about a `.env` it had just been refused.
+
+With `--ledger`, the records are saved next to the ledger as
+`LEDGER.runs.jsonl`: append-only and hash-chained, each run's record matching
+the digest the ledger signed. The output of a call withheld from the model
+is not written there either; only its digest is kept. To check the records
+against the ledger:
+
+    python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl
+
 ### A model on your own hardware
 
     python3 guarded_agent.py "..." --workdir DIR --backend openai-compatible \

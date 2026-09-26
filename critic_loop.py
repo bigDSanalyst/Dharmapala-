@@ -1,5 +1,5 @@
 
-import tempfile
+import hashlib, json, tempfile
 from tools import Sandbox
 from observation import observe
 from vow_lean import emit_vow_compliance
@@ -40,7 +40,9 @@ class CriticLoop:
                 plan = [(tool, kwargs) for tool, kwargs, _ in dry.calls]
                 return effects, True, plan
             if self.guard is not None:
+                plan = [(tool, kwargs) for tool, kwargs, _ in dry.calls]
                 self.guard.record_refusal(
+                    action_digest=hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest(),
                     class_id="critic:" + ("+".join(violations) or "rejected"),
                     reason=f"critic rejected attempt {attempt + 1}: {error.splitlines()[0] if error else ''}",
                     notes=(f"critic: {which_critic()}",))

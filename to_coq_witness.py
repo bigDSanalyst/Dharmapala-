@@ -12,14 +12,16 @@ class CoqWitness:
 
 class Certificate:
     def __init__(self, label):
-        self.label = label; self.witnesses = []
+        self.label = label; self.witnesses = []; self.preamble = []
     def add(self, w): self.witnesses.append(w); return self
+    def define(self, lines): self.preamble.extend(lines); return self
     def emit(self, path=None):
         if path is None:
             fd, path = tempfile.mkstemp(suffix=".v", prefix=f"pqv_{self.label}_")
             os.close(fd)
         lines = [f"(* CERTIFICATE: {self.label} *)",
                  "Require Import ZArith.", "Open Scope Z_scope.", ""]
+        lines += self.preamble + ([""] if self.preamble else [])
         for w in self.witnesses:
             lines.append(f"Theorem {w.name} : {w.statement}.")
             lines.append("Proof. vm_compute. reflexivity. Qed.")
@@ -43,21 +45,28 @@ class Certificate:
         except OSError as e:
             return None, f"coqc found but could not run: {e}"
     def certificate_hash(self):
-        payload = "|".join(f"{w.name}:{w.statement}" for w in self.witnesses)
+        # The preamble is hashed too: it defines what the statements mean.
+        payload = "\n".join(self.preamble) + "||" + "|".join(
+            f"{w.name}:{w.statement}" for w in self.witnesses)
         return hashlib.sha256(payload.encode()).hexdigest()
 
 @dataclass(frozen=True)
 class Attestation:
     engine_id: str; engine_name: str; binary_hash: str; epoch: int
     inputs_hash: str; certificate_hash: str; output_hash: str
-    co_signer_id: str; certificate_status: str = ""; signature: str = ""
+    co_signer_id: str; certificate_status: str = ""
+    # What was decided, and about which action under which Vow. Signed, so an
+    # attestation cannot be moved to another record (ledger.verify_integrity).
+    action_digest: str = ""; vow_hash: str = ""; verdict: str = ""
+    signature: str = ""
     @property
     def signer_id(self): return self.co_signer_id
     def payload(self):
         return (f"{self.engine_id}|{self.engine_name}|{self.binary_hash}|"
                 f"{self.epoch}|{self.inputs_hash}|{self.certificate_hash}|"
                 f"{self.output_hash}|{self.co_signer_id}|"
-                f"{self.certificate_status}").encode()
+                f"{self.certificate_status}|{self.action_digest}|"
+                f"{self.vow_hash}|{self.verdict}").encode()
     def attestation_hash(self):
         return hashlib.sha256(self.payload()).hexdigest()
 
@@ -68,18 +77,36 @@ class DecisionError(Exception): pass
 def _hash(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
 
-def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs, co_signer_id):
+def build_certificate(label, outputs, decision=None, q=3329):
+    # One construction for proposer and co-signer alike, so the co-signer can
+    # rebuild the certificate it is asked to vouch for instead of trusting it.
+    cert = Certificate(label)
+    for i, b in enumerate(outputs.get("butterflies", [])):
+        we, wo = witness_zq_butterfly(q, b["a"], b["b"], b["w"], b["ea"], b["eb"], i)
+        cert.add(we).add(wo)
+    if decision is not None:
+        cert.define(decision.coq_preamble())
+        cert.add(CoqWitness(name="decision", statement=decision.coq_statement(),
+                            engine_output={"verdict": decision.verdict},
+                            engine_name="vow/decision"))
+    return cert
+
+def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
+            co_signer_id, decision=None):
     return Attestation(engine_id=engine_id, engine_name=engine_name,
                        binary_hash=binary_hash, epoch=epoch,
                        inputs_hash=_hash(inputs),
                        certificate_hash=cert.certificate_hash(),
-                       output_hash=_hash(outputs), co_signer_id=co_signer_id)
+                       output_hash=_hash(outputs), co_signer_id=co_signer_id,
+                       action_digest=decision.action_digest if decision else "",
+                       vow_hash=decision.vow_hash if decision else "",
+                       verdict=decision.verdict if decision else "")
 
 class CoSigner:
     def __init__(self, signer, require_coqc=False):
         self.id = signer.id; self._signer = signer
         self.require_coqc = require_coqc; self.notes = []
-    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn):
+    def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None):
         self.notes = []
         if proposal.co_signer_id != self.id:
             raise RefusedToSign("proposal addressed to a different co-signer")
@@ -97,7 +124,28 @@ class CoSigner:
             self.notes.append("output: MISMATCH")
             raise RefusedToSign("output mismatch")
         self.notes.append("re-run output: match")
-        ok, out = Certificate.check(cert_path)
+        if decision is not None:
+            # Decide independently, then check the proposal says the same.
+            from decision import verdict_of
+            mine = verdict_of(decision.effects, decision.forbidden)
+            if (mine, decision.action_digest, decision.vow_hash) != \
+                    (proposal.verdict, proposal.action_digest, proposal.vow_hash):
+                self.notes.append("decision: MISMATCH")
+                raise RefusedToSign(f"decision mismatch: proposal={proposal.verdict} cosigner={mine}")
+            self.notes.append("decision: match")
+        elif proposal.verdict or proposal.action_digest:
+            raise RefusedToSign("proposal carries a decision the co-signer was not shown")
+        # Check the certificate this co-signer builds, not the file it was
+        # handed: the handed file need not be the one whose hash was proposed.
+        own = build_certificate(f"cosign_{self.id}", recomputed, decision)
+        if own.certificate_hash() != proposal.certificate_hash:
+            self.notes.append("certificate: MISMATCH")
+            raise RefusedToSign("certificate hash mismatch")
+        own_path = own.emit()
+        try: ok, out = Certificate.check(own_path)
+        finally:
+            try: os.remove(own_path)
+            except FileNotFoundError: pass
         if ok is None:
             self.notes.append("certificate: coqc unavailable")
             if self.require_coqc:

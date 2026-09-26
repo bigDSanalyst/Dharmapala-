@@ -55,13 +55,24 @@ class Ledger:
         if self.audits:
             for i in range(1, len(self.audits)):
                 if self.audits[i].prev_audit_hash != self.audits[i-1].hash(): return False
+        cited = set()
         for r in self.records:
             if r.attestation_hash and not isinstance(self.attestations.get(r.attestation_hash), Attestation):
                 return False
+            if r.attestation_hash:
+                # An attestation vouches for one decision: this action, this
+                # verdict, this Vow. It cannot be cited by a second record.
+                a = self.attestations[r.attestation_hash]
+                if (a.action_digest, a.verdict, a.vow_hash) != (r.action_digest, r.verdict_kind, r.vow_hash):
+                    return False
+                if r.attestation_hash in cited: return False
+                cited.add(r.attestation_hash)
             if not self._trajectory_ok(r.trajectory_attestation, r.action_digest, "LAWFUL"):
                 return False
         for a in self.audits:
-            if not self._trajectory_ok(a.trajectory_attestation, None, "LEARNING"):
+            if a.trajectory_attestation and not a.action_digest:
+                return False            # a refusal attestation must name the action it refused
+            if not self._trajectory_ok(a.trajectory_attestation, a.action_digest or None, "LEARNING"):
                 return False
         if not all(self.signature_ok(h, a) for h, a in self.attestations.items()):
             return False

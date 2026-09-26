@@ -5,9 +5,9 @@ from enum import Enum, auto
 from typing import Optional
 from vow import Vow, Action
 from audit import AuditEntry
-from to_coq_witness import (Certificate, Record, propose, CoSigner,
-                            RefusedToSign, ConfigError, DecisionError,
-                            witness_zq_butterfly)
+from to_coq_witness import (Record, propose, CoSigner, build_certificate,
+                            RefusedToSign, ConfigError, DecisionError)
+from decision import Decision
 
 class VerdictKind(Enum):
     LAWFUL = auto(); LEARNING = auto()
@@ -48,7 +48,7 @@ class Guard:
                 "refused": self.refusals, "confidence": self.confidence}
     def integrity(self): return self.ledger.verify_integrity()
     def record_refusal(self, class_id, reason, notes=(), certificate_path="",
-                       attestation_hash="", trajectory_attestation=""):
+                       attestation_hash="", trajectory_attestation="", action_digest=""):
         self.ledger.record_audit(AuditEntry(
             index=len(self.ledger.audits) + self.ledger._audits_offset(),
             prev_audit_hash=self.ledger.audit_head(),
@@ -57,12 +57,23 @@ class Guard:
             guard_id=self.id, class_id=class_id, reason=reason,
             co_signer_notes=tuple(notes), certificate_path=certificate_path,
             attestation_hash=attestation_hash,
-            trajectory_attestation=trajectory_attestation, timestamp=time.time()))
+            trajectory_attestation=trajectory_attestation, timestamp=time.time(),
+            action_digest=action_digest))
 
     def engage(self, action, vow, co_signer, traj_cosigner, class_id,
                inputs, re_run_fn, binary_path, binary_hash):
         if not class_id:
-            return Verdict(VerdictKind.LAWFUL, "routine", action.id, self.id)
+            # Routine: no stress test and no certificate, but still judged. A
+            # routine action with a forbidden effect is refused, not waved on.
+            d = Decision.of(action, vow)
+            if d.verdict == "LAWFUL":
+                return Verdict(VerdictKind.LAWFUL, "routine", action.id, self.id)
+            bad = [e for e in d.forbidden if e in d.effects]
+            self.record_refusal(class_id="routine:" + "+".join(bad),
+                                reason=f"routine action carries forbidden effects {bad}",
+                                action_digest=d.action_digest)
+            return Verdict(VerdictKind.LEARNING, f"routine action carries forbidden effects {bad}",
+                           action.id, self.id)
         traj_clauses = vow.trajectories()
         prior_state = (); traj_att = None; traj_ref = ""
         if traj_clauses:
@@ -86,35 +97,34 @@ class Guard:
                     class_id=f"traj:{immediate[0]}",
                     reason=f"trajectory violation: {immediate}",
                     notes=(f"{traj_cosigner.id}: {traj_ref[:16]}",),
-                    trajectory_attestation=traj_ref)
+                    trajectory_attestation=traj_ref,
+                    action_digest=action.canonical_digest())
                 return Verdict(VerdictKind.LEARNING,
                                f"trajectory violation: {immediate}",
                                action.id, self.id)
         outputs = re_run_fn(inputs)
-        q = 3329
-        cert = Certificate(f"{self.id}_{len(self.ledger.records)}")
-        for i, b in enumerate(outputs.get("butterflies", [])):
-            we, wo = witness_zq_butterfly(q, b["a"], b["b"], b["w"],
-                                          b["ea"], b["eb"], i)
-            cert.add(we).add(wo)
+        decision = Decision.of(action, vow)
+        cert = build_certificate(f"{self.id}_{len(self.ledger.records)}", outputs, decision)
         cert_path = cert.emit()
         proposal = propose(engine_id=self.id, engine_name="guard",
                            binary_hash=binary_hash, epoch=len(self.ledger.records),
                            inputs=inputs, cert=cert, outputs=outputs,
-                           co_signer_id=co_signer.id)
+                           co_signer_id=co_signer.id, decision=decision)
         try:
-            signed = co_signer.cosign(proposal, cert_path, inputs, binary_path, re_run_fn)
+            signed = co_signer.cosign(proposal, cert_path, inputs, binary_path,
+                                      re_run_fn, decision=decision)
         except ConfigError as e:
             return Verdict(VerdictKind.FAILURE_CONFIG, str(e), action.id, self.id)
         except DecisionError as e:
             return Verdict(VerdictKind.FAILURE_DECISION, str(e), action.id, self.id)
         except RefusedToSign as e:
             self.record_refusal(class_id=class_id, reason=str(e),
-                                notes=co_signer.notes, certificate_path=cert_path)
+                                notes=co_signer.notes, certificate_path=cert_path,
+                                action_digest=decision.action_digest)
             return Verdict(VerdictKind.FAILURE_REFUSAL, str(e), action.id, self.id)
         self.ledger.store_attestation(signed)
         if traj_att is not None: self.ledger.store_attestation(traj_att)
-        kind = self._classify(action, vow)
+        kind = VerdictKind[decision.verdict]
         record = Record(
             index=len(self.ledger.records) + self.ledger._records_offset(),
             prev_hash=self.current_hash,

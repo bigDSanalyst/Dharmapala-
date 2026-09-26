@@ -57,6 +57,21 @@ The default Vow forbids:
 `--vow FILE` replaces it. Credentials come from `ANTHROPIC_API_KEY` or
 `ant auth login`.
 
+### A model on your own hardware
+
+    python3 guarded_agent.py "..." --workdir DIR --backend openai-compatible \
+        --base-url http://localhost:8000/v1 --model NAME
+
+Any server that speaks OpenAI-style chat completions with tool calls will
+work: vLLM, Ollama, llama.cpp's server or LM Studio. If the server wants a
+key, the environment variable named by `--api-key-env` supplies it (default
+`OPENAI_API_KEY`).
+
+The gate behind the model is the same whichever model it is. What changes is
+where a lawful call's output goes: with a local model it stays on your
+network. Local models emit malformed tool arguments more often than hosted
+ones. Such a call is refused, never guessed at, and the model is told why.
+
 ### Policy
 
 The Vow says which effects are forbidden. The policy (`policy.py`) says what

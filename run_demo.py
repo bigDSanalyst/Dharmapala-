@@ -72,7 +72,7 @@ def main():
     jail_ok, jail_why = jail.available()
     print(f"[jail] {'bubblewrap + strace' if jail_ok else 'unavailable: ' + jail_why}")
     agent = Agent(Sandbox(os.path.join(tmpdir, "dry")))
-    critic = CriticLoop(agent, vow, verbose=True, guard=guard)
+    critic = CriticLoop(agent, vow, verbose=True, guard=guard, rehearse=jail_ok)
 
     print("=" * 68)
     print("  DHARMAPALA — critic loop + ensemble + 12 layers")
@@ -88,7 +88,7 @@ def main():
                                                           guard_nonce=gn.reveal())):
             if eng is not None:
                 print(f"    [adv {i}] would select: {eng.class_id}")
-        effects, ok, plan = critic.propose_and_verify(goal)
+        effects, ok, plan = critic.propose_and_verify(goal, workdir=os.path.join(tmpdir, f"sb_{epoch}"))
         if not ok:
             print("    -> no compliant plan"); verdicts[epoch] = "NO_PLAN"; continue
         if not plan:

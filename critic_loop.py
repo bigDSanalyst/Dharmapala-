@@ -1,5 +1,5 @@
 
-import hashlib, json, pathlib, tempfile
+import hashlib, json, pathlib, shutil, tempfile
 from tools import Sandbox
 from observation import observe
 from vow_lean import emit_vow_compliance
@@ -18,21 +18,55 @@ def execute(plan, dry_effects, workdir, jail=False):
     if (effects - set(dry_effects)) - {"read", "write", "exec"}: effects.add("diverged")
     return effects, real.calls
 
+def rehearse(plan, dry_effects, workdir=None):
+    """Run the plan for real, in the jail, against a throwaway copy of the
+    workdir it is meant for, and return what it did (None if the jail could
+    not run it). The copy is what makes a rehearsal worth having: a script
+    already in the workdir is invisible to a dry run and runs here."""
+    scratch = tempfile.mkdtemp(prefix="rehearsal_")
+    copy = pathlib.Path(scratch) / "work"
+    try:
+        if workdir and pathlib.Path(workdir).is_dir():
+            shutil.copytree(workdir, copy, symlinks=True)
+        else:
+            copy.mkdir()
+        effects, calls = execute(plan, dry_effects, str(copy), jail=True)
+        if any(tool == "shell" and not result.get("jailed") for tool, _, result in calls):
+            return None
+        effects.discard("diverged")     # the rehearsal is the prediction, not a deviation from one
+        return effects
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
 class CriticLoop:
     def __init__(self, agent, vow, lake_root='/content/dharma/lean',
-                 max_retries=3, verbose=True, guard=None):
+                 max_retries=3, verbose=True, guard=None, rehearse=False):
+        # rehearse=True: before a plan is accepted it runs for real in the
+        # jail against a throwaway copy of its workdir, and the critic judges
+        # what that run did as well as what the dry run predicted.
         self.agent = agent; self.vow = vow; self.lake_root = lake_root
         self.max_retries = max_retries; self.verbose = verbose
-        self.guard = guard
+        self.guard = guard; self.rehearse = rehearse
         self.attempts = []
         self.unchecked = 0      # attempts the critic could not judge at all
-    def propose_and_verify(self, goal):
+    def propose_and_verify(self, goal, workdir=None):
         context = ""
         for attempt in range(self.max_retries):
             dry = Sandbox(tempfile.mkdtemp(), dry_run=True)
             self.agent.sandbox = dry
             self.agent.act(goal, context=context)
             effects = observe(dry.calls, dry.workdir)
+            rehearsed = None
+            if self.rehearse:
+                rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir)
+                if rehearsed is None:
+                    # Asked to rehearse and could not: the plan is not judged.
+                    self.unchecked += 1
+                    self.attempts.append({"attempt": attempt + 1, "effects": sorted(effects),
+                                          "accepted": False, "unchecked": "rehearsal could not run in the jail"})
+                    if self.verbose: print("    critic could not judge: rehearsal could not run in the jail")
+                    return set(), False, []
+                effects = effects | rehearsed
             source, violations = emit_vow_compliance(effects, self.vow)
             ok, error = check(source, self.lake_root)
             if ok is None:
@@ -53,6 +87,7 @@ class CriticLoop:
             self.attempts.append({"attempt": attempt + 1,
                                   "effects": sorted(effects),
                                   "violations": violations, "lean_ok": lean_ok,
+                                  "rehearsed": sorted(rehearsed) if rehearsed is not None else None,
                                   "accepted": ok})
             if self.verbose:
                 print(f"    attempt {attempt+1}: effects={sorted(effects)}")

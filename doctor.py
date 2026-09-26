@@ -32,6 +32,11 @@ def observe(ledger):
         findings.append(Finding("DEGRADED", "unchecked_certificates",
                                 f"{len(unchecked)} attestation(s) signed without coqc checking the certificate",
                                 "install coqc (apt install coq) and re-run"))
+    if getattr(ledger, "unpinned", ()):
+        findings.append(Finding("LOOK", "keys_from_the_file",
+                                f"{', '.join(ledger.unpinned)}: public keys were read from the ledger file "
+                                "itself, so verification shows only that the file agrees with itself",
+                                "pass pinned={signer: key_id} to Ledger.load"))
     shared = sorted(v.id for v in ledger.verifiers.values() if not v.publicly_verifiable)
     if shared:
         findings.append(Finding("DEGRADED", "shared_secret_signers",

@@ -9,6 +9,33 @@ from trajectory import TrajectoryAttestation
 GENESIS_HASH = "0" * 64
 
 class FormationError(Exception): pass
+class KeyMismatch(Exception): pass
+
+# Persisted form: every dataclass is tagged with its type, so a ledger file
+# loads back into the same objects and verifies the same way. Lists inside a
+# tagged object come back as tuples, which is how every such field is built.
+def _types():
+    from compression import Checkpoint, TraceLeaf
+    from fraud import FraudProof
+    return {c.__name__: c for c in (Record, AuditEntry, Attestation, TrajectoryAttestation,
+                                    Checkpoint, TraceLeaf, FraudProof)}
+
+def _enc(x):
+    if hasattr(x, "__dataclass_fields__"):
+        return {"__t": type(x).__name__, **{k: _enc(v) for k, v in x.__dict__.items()}}
+    if isinstance(x, (list, tuple)): return [_enc(v) for v in x]
+    if isinstance(x, dict): return {k: _enc(v) for k, v in x.items()}
+    return x
+
+def _dec(x, types, in_obj=False):
+    if isinstance(x, dict) and "__t" in x:
+        cls = types[x["__t"]]
+        return cls(**{k: _dec(v, types, True) for k, v in x.items() if k != "__t"})
+    if isinstance(x, list):
+        items = [_dec(v, types, in_obj) for v in x]
+        return tuple(items) if in_obj else items
+    if isinstance(x, dict): return {k: _dec(v, types, in_obj) for k, v in x.items()}
+    return x
 
 @dataclass
 class Ledger:
@@ -20,6 +47,7 @@ class Ledger:
     audits: list = field(default_factory=list)
     checkpoints: list = field(default_factory=list)   # compression.Checkpoint, oldest first
     disputes: list = field(default_factory=list)      # (checkpoint index, fraud.FraudProof)
+    unpinned: tuple = ()     # signer ids whose keys came from the loaded file itself
     verifiers: dict = field(default_factory=dict)
 
     def register_verifier(self, v):
@@ -152,9 +180,50 @@ class Ledger:
     def _persist(self):
         if self.path is None: return
         with open(self.path, "w") as f:
-            json.dump({"sangha_id": self.sangha_id,
-                       "records": [r.__dict__ for r in self.records],
-                       "attestations": {h: a.__dict__ for h, a in self.attestations.items()},
-                       "audits": [a.__dict__ for a in self.audits],
-                       "checkpoints": [c.__dict__ for c in self.checkpoints]},
-                      f, indent=2, sort_keys=True, default=str)
+            json.dump({"format": "dharmapala-ledger/v2", "sangha_id": self.sangha_id,
+                       "genesis_hash": self.genesis_hash,
+                       "records": _enc(self.records), "audits": _enc(self.audits),
+                       "attestations": _enc(self.attestations),
+                       "checkpoints": _enc(self.checkpoints),
+                       "disputes": [[i, _enc(p)] for i, p in self.disputes],
+                       # Public keys only. A shared-secret (HMAC) verifier has
+                       # none to write: whoever loads such a ledger must supply it.
+                       "verifiers": {v.id: {"scheme": v.scheme,
+                                            "public": v._pub.hex() if v.publicly_verifiable else None}
+                                     for v in self.verifiers.values()}},
+                      f, indent=2, sort_keys=True)
+
+    @classmethod
+    def load(cls, path, pinned=None, extra_verifiers=()):
+        """Load a persisted ledger. It is not trusted by being loaded: call
+        verify_integrity() on the result.
+
+        Keys stored in the file prove only that the file agrees with itself:
+        anyone who can edit it can swap a key and re-sign. `pinned` maps
+        signer id -> expected key_id; a stored key that differs is refused.
+        Signers whose keys are taken from the file unpinned are listed in
+        .unpinned, and doctor reports them. HMAC verifiers have no public key
+        to store and must come in through extra_verifiers."""
+        from signing import PublicVerifier
+        data = json.load(open(path))
+        if data.get("format") != "dharmapala-ledger/v2":
+            raise ValueError(f"{path}: not a dharmapala-ledger/v2 file")
+        types = _types()
+        L = cls(data["sangha_id"], path=None, genesis_hash=data["genesis_hash"])
+        L.records = _dec(data["records"], types)
+        L.audits = _dec(data["audits"], types)
+        L.attestations = _dec(data["attestations"], types)
+        L.checkpoints = _dec(data["checkpoints"], types)
+        L.disputes = [(i, _dec(p, types)) for i, p in data["disputes"]]
+        pinned = dict(pinned or {}); unpinned = []
+        for sid, v in sorted(data["verifiers"].items()):
+            if v["public"] is None: continue
+            pv = PublicVerifier(sid, v["scheme"], bytes.fromhex(v["public"]))
+            if sid in pinned:
+                if pv.key_id() != pinned[sid]:
+                    raise KeyMismatch(f"{path}: key stored for {sid!r} is not the pinned one")
+            else: unpinned.append(sid)
+            L.register_verifier(pv)
+        for v in extra_verifiers: L.register_verifier(v)
+        L.unpinned = tuple(unpinned); L.path = path
+        return L

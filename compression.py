@@ -149,8 +149,9 @@ def compress(ledger, cut_epoch, signer):
     if signer.id not in ledger.verifiers:
         raise CompressionError(f"signer {signer.id!r} has no registered verifier")
     last = ledger.checkpoints[-1] if ledger.checkpoints else None
-    if last is not None and cut_epoch <= last.cut_epoch:
-        raise CompressionError(f"cut {cut_epoch} is not past the last checkpoint ({last.cut_epoch})")
+    if cut_epoch <= (last.cut_epoch if last else 0):
+        raise CompressionError(f"cut {cut_epoch} is not past the last checkpoint "
+                               f"({last.cut_epoch if last else 0}): nothing to erase")
     if cut_epoch > ledger.next_record_index():
         raise CompressionError(f"cut {cut_epoch} is beyond the ledger ({ledger.next_record_index()})")
     recs = [r for r in ledger.records if r.index < cut_epoch]

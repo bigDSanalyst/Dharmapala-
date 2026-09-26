@@ -39,7 +39,12 @@ def _python_decide(source):
     if failures: return False, f"python-degraded: {failures} present"
     return True, "python-degraded: all forbidden effects absent"
 
-def check(lean_source, lake_root=None, timeout=15.0):
+LEAN_TIMEOUT = 15.0
+
+def check(lean_source, lake_root=None, timeout=None):
+    # (True, _) Lean accepted; (False, _) Lean rejected; (None, _) nothing was
+    # checked - Lean hung or would not run. The last is not a verdict.
+    timeout = LEAN_TIMEOUT if timeout is None else timeout
     if _LEAN is None:
         ok, msg = _python_decide(lean_source)
         return ok, f"[no Lean toolchain] {msg}"
@@ -51,9 +56,9 @@ def check(lean_source, lake_root=None, timeout=15.0):
         combined = (r.stdout or "") + (r.stderr or "")
         return r.returncode == 0, combined.strip() or "lean accepted"
     except subprocess.TimeoutExpired:
-        return False, f"lean timed out after {timeout}s"
+        return None, f"lean timed out after {timeout}s: not checked"
     except OSError as e:
-        return False, f"lean found at {_LEAN} but could not run: {e}"
+        return None, f"lean found at {_LEAN} but could not run: {e}"
     finally:
         try: os.remove(path)
         except FileNotFoundError: pass

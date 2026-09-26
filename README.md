@@ -84,6 +84,12 @@ against the ledger:
 
     python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl
 
+Each run needs its own `--ledger`. If the ledger or run-records file is
+already there, the agent refuses to start (exit 1, naming the file) rather
+than replace one run's ledger and append to its records, which would leave
+two files that no longer describe one run. The account printed after a run
+shows only that run's calls.
+
 ### A model on your own hardware
 
     python3 guarded_agent.py "..." --workdir DIR --backend openai-compatible \

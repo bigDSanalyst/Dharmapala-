@@ -171,3 +171,72 @@ def test_the_command_line_prints_the_account_beside_the_answer(tmp_path):
     assert out.index("notes.txt now reads alpha, beta, gamma") < out.index("what actually happened")
     assert 'wrote notes.txt <- "${response.body}gamma" (21 bytes)' in out
     assert f"runs: {tmp_path / 'l.json'}.runs.jsonl" in out
+
+# --- one run, one record ----------------------------------------------------------------------------
+#
+# In a live run on Colab the same --ledger was given twice. The second run's
+# ledger replaced the first's, its records were appended to the first run's,
+# and "what actually happened" listed the first run's calls as its own.
+
+def _serve(*replies):
+    from tests.test_backends import _Handler
+    from http.server import HTTPServer
+    import threading
+    srv = HTTPServer(("127.0.0.1", 0), _Handler); srv.seen, srv.script = [], list(replies)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+def _cli(tmp_path, srv, *args):
+    work = tmp_path / "w"; work.mkdir(exist_ok=True)
+    return subprocess.run([sys.executable, str(ROOT / "guarded_agent.py"), "task", "--workdir", str(work),
+                           "--backend", "openai-compatible", "--model", "m",
+                           "--base-url", f"http://127.0.0.1:{srv.server_port}/v1", *args],
+                          capture_output=True, text=True, timeout=120)
+
+def test_the_same_ledger_twice_is_refused_and_the_first_run_is_left_as_it_was(tmp_path):
+    from tests.test_backends import call as ocall, reply
+    srv = _serve((200, reply(tool_calls=[ocall(1, "file_write", {"path": "notes.txt", "content": "gamma"})],
+                             finish="tool_calls")),
+                 (200, reply("done")))
+    lp = tmp_path / "l.json"; rp = tmp_path / "l.json.runs.jsonl"
+    try:
+        first = _cli(tmp_path, srv, "--ledger", str(lp))
+        assert first.returncode == 0, first.stderr
+        before = (lp.read_bytes(), rp.read_bytes()); asked = len(srv.seen)
+        second = _cli(tmp_path, srv, "--ledger", str(lp))
+    finally: srv.shutdown(); srv.server_close()
+    assert second.returncode == 1 and "Traceback" not in second.stderr
+    assert f"ledger: {lp} already exists; choose a new --ledger" in second.stderr
+    assert len(srv.seen) == asked                               # the model was never asked
+    assert (lp.read_bytes(), rp.read_bytes()) == before
+
+@pytest.mark.parametrize("which", ["runs", "same"])
+def test_existing_run_records_or_one_file_for_both_are_refused(tmp_path, which):
+    srv = _serve()
+    rp = tmp_path / "r.jsonl"
+    if which == "runs":
+        rp.write_text("kept\n"); args = ("--ledger", str(tmp_path / "new.json"), "--runs", str(rp))
+        why = f"run records: {rp} already exists; choose a new --ledger and --runs"
+    else:
+        args = ("--ledger", str(rp), "--runs", str(rp)); why = "--ledger and --runs name the same file"
+    try: r = _cli(tmp_path, srv, *args)
+    finally: srv.shutdown(); srv.server_close()
+    assert r.returncode == 1 and why in r.stderr and not srv.seen
+    assert not (tmp_path / "new.json").exists()
+    if which == "runs": assert rp.read_text() == "kept\n"
+
+def test_the_account_shows_only_this_runs_calls(tmp_path, capsys):
+    """However a run log comes to continue another run's file, the account of
+    this run is of this run."""
+    import argparse
+    rp = str(tmp_path / "r.jsonl")
+    earlier = runs.RunLog(rp); earlier.add("1", "file_read", {"path": ".env"}, "refused", "earlier run")
+    work = tmp_path / "work"; work.mkdir()
+    gate, L = ga.setup(work, policy=STRICT, runs_path=rp)
+    assert gate.runs.start == 1
+    _, answer = ga.GuardedAgent(Scripted(turn(call(1, "file_write", path="a.txt", content="gamma")),
+                                         turn(text("wrote it"), stop="end_turn")), gate).run("task")
+    assert [e["seq"] for e in gate.runs.this_run] == [1] and len(gate.runs.entries) == 2
+    ga._report(gate, L, STRICT, work, argparse.Namespace(ledger=None), True, answer)
+    out = capsys.readouterr().out
+    assert 'wrote a.txt <- "gamma" (5 bytes)' in out and "earlier run" not in out and ".env" not in out

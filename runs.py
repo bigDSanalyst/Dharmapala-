@@ -41,10 +41,18 @@ def _roundtrip(obj):
     return json.loads(json.dumps(obj))
 
 class RunLog:
-    """The entries of one run, written to `path` (if any) as they happen."""
+    """The entries of one run, written to `path` (if any) as they happen.
+    Given a file that already has entries, it continues their chain; `start`
+    is where this run's own entries begin."""
     def __init__(self, path=None):
         self.path = path
         self.entries = load(path) if path and os.path.exists(path) else []
+        self.start = len(self.entries)
+
+    @property
+    def this_run(self):
+        """This run's entries only: an account of this run must not show another's calls."""
+        return self.entries[self.start:]
 
     def add(self, call_id, tool, args, outcome, detail, evidence=None, withheld=False):
         from critic_loop import evidence_digest

@@ -70,6 +70,7 @@ def main():
     print(f"[adversary] ensemble of {len(ensemble)}; scheme={signer_a.scheme}")
 
     jail_ok, jail_why = jail.available()
+    beta.reexecute = jail_ok        # with a jail, the co-signer runs each plan again itself
     print(f"[jail] {'bubblewrap + strace' if jail_ok else 'unavailable: ' + jail_why}")
     agent = Agent(Sandbox(os.path.join(tmpdir, "dry")))
     critic = CriticLoop(agent, vow, verbose=True, guard=guard, rehearse=jail_ok)
@@ -97,15 +98,18 @@ def main():
         # Shell commands really run only inside the jail; without one they are
         # recorded and not run, and the jail layer below reports it.
         workdir = os.path.join(tmpdir, f"sb_{epoch}")
+        snap = beta.snapshot(workdir) if beta.reexecute else None   # before anything runs
         observed, calls = execute(plan, effects, workdir, jail=jail_ok)
         executed.append(observed)
         print(f"    executed plan: {len(plan)} call(s) -> observed={sorted(observed)}")
         action = Action(id=f"a{epoch}", verb="execute", domain="action", payload={})
         action._observed_effects = observed
         action._evidence = evidence_of(calls, workdir, effects)   # the co-signer re-derives from this
+        action._snapshot = snap
         inputs = {"butterflies": [(100 + epoch, 200, 17)]}
         verdict = guard.engage(action, vow, beta, tb, f"c{epoch}", inputs,
                                 engine_run, bp, bh)
+        beta.release(snap)
         verdicts[epoch] = verdict.kind.name
         print(f"    verdict: {verdict.kind.name}")
 

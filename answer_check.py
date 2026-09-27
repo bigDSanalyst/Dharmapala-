@@ -82,7 +82,7 @@ def differences(answer, entries):
             if _norm(claimed) != _norm(actual):
                 found.append(f"content  the answer shows {path} as {runs._show(_norm(claimed))}; "
                              f"the record shows it last as {runs._show(actual)}")
-    stopped = [e for e in entries if e.get("outcome") not in ("lawful", "invalid")]
+    stopped = [e for e in entries if e.get("outcome") not in ("lawful", "invalid", "note")]
     if stopped and not REFUSAL_WORDS.search(answer) and \
             not any(_mentions(answer, _target(e.get("tool"), e.get("args"))) for e in stopped):
         counts = {}

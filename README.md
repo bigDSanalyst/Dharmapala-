@@ -89,6 +89,16 @@ Prose descriptions and anything after a lawful shell call, which may have
 changed any file, are not checked. No model is asked to judge, and the report
 names a difference, never a motive.
 
+When a difference is found, the model gets one more turn, once. It is shown the
+differences and what the record shows call by call, and asked to correct its
+answer or finish the work so the answer becomes true. Every call it makes then
+goes through the gate like any other. Its new answer is a claim like the first
+one and is checked the same way. The report shows both answers and says whether
+they now agree. Both the differences shown and the result of the recheck are
+entries in the run record, beside the calls. `--no-reconcile` turns this off.
+Arguing does not help: an answer that only insists still differs, and the
+report says so.
+
 With `--ledger`, the records are saved next to the ledger as
 `LEDGER.runs.jsonl`: append-only and hash-chained, each run's record matching
 the digest the ledger signed. The output of a call withheld from the model

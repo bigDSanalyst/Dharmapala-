@@ -39,6 +39,10 @@ class AnthropicBackend:
 
     def start(self, task): self.messages = [{"role": "user", "content": task}]
 
+    def say(self, text):
+        """One more user message, after the model has finished its turn."""
+        self.messages.append({"role": "user", "content": text})
+
     def step(self):
         r = self.client.beta.messages.create(
             model=self.model, max_tokens=self.max_tokens, system=self.system, tools=self.tools,
@@ -86,6 +90,10 @@ class OpenAICompatibleBackend:
 
     def start(self, task):
         self.messages = [{"role": "system", "content": self.system}, {"role": "user", "content": task}]
+
+    def say(self, text):
+        """One more user message, after the model has finished its turn."""
+        self.messages.append({"role": "user", "content": text})
 
     def step(self):
         r = self._post(self.url, {"model": self.model, "messages": self.messages, "tools": self.tools,

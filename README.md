@@ -145,6 +145,73 @@ Each verdict names the policy that judged it. The run record carries the
 policy, and the attestation signs its hash. The co-signer vouches under exactly
 one policy and refuses a decision made under any other.
 
+## On AgentDojo
+
+    pip install agentdojo==0.1.35
+    python3 eval_agentdojo.py                          # the guard, no model: about an hour on 4 cores
+    python3 eval_agentdojo.py --model qwen2.5:7b --base-url http://localhost:11434/v1 --suites banking --limit 4
+
+[AgentDojo](https://github.com/ethz-spylab/agentdojo) is the benchmark prompt-injection defences
+report on. It has 97 user tasks in four suites (workspace, travel, banking, slack), each paired with
+the suite's injection tasks. Its tools change state instead of files: they send money, send mail,
+share files and invite users. `agentdojo_guard.py` reads each call's effects from that state:
+
+1. The call runs on a copy of the environment.
+2. The guard diffs the copy and reads the diff under `policies/agentdojo.json`. Money, mail, a share,
+   a message or a web request to a party that is not trusted is `exfiltrate`. A party is trusted if
+   it is the user's own identity, was already in the environment, or is named in the user's prompt.
+   An unknown new user, or a password the user did not give, is `dominate`. A removal is `destruct`.
+3. A witness runs the call again on its own copy, at the same clock reading, and diffs it with its
+   own code. If the two readings differ, the call is refused.
+4. Otherwise the verdict goes through `Guard.engage` (Coq certificate, ML-DSA co-signer, ledger).
+5. Only a lawful call's copy becomes the environment, so a refused call changes nothing.
+
+With no model, `eval_agentdojo.py` plays a *hijacked* agent. It makes the user task's calls and
+then every call of the injection task, and AgentDojo's own checks score the run. That is the worst
+case: the model is already won over and the guard is all that is left. Every attack also runs
+without the guard, which shows it is real. 593 of the 949 pairs succeed unguarded, and only
+those are counted. `results/agentdojo-default.json`:
+
+| suite | utility, no guard -> guard | attacks that succeed (AgentDojo's score) | of calls that ran |
+|---|---|---|---|
+| banking | 16/16 -> 15/16 | 0/141 (0%) | 0% |
+| slack | 21/21 -> 19/21 | 63/105 (60%) | 40% |
+| travel | 20/20 -> 20/20 | 57/116 (49%) | 49% |
+| workspace | 40/40 -> 40/40 | 40/231 (17%) | 17% |
+| **total** | **97 -> 94** | **160/593 (27.0%)** | **23.4%** |
+
+The strict Vow also forbids `destruct` (`results/agentdojo-strict.json`). That takes workspace to
+0/231 and the total to 120/593 (20.2%, or 16.7% of calls that ran), and utility to 92/97.
+
+What these numbers are and are not:
+
+- **No model was run.** The "hijacked agent" always obeys the injection, so these are not an attack
+  success rate for any model and are not comparable to CaMeL's or MELON's model runs. They measure
+  what is left once the model is lost. `--model` runs a real one through the same guard.
+- **The guard stops what the attacker's calls do to parties.** It stops money or data going to
+  strangers, strangers invited in, and passwords changed. That covers all of banking, and all of
+  workspace under the strict Vow.
+- **It does not stop what looks like the user's own business.** Examples: a phishing link sent to a
+  colleague, a hotel booked for the user, a calendar event created, and a visit to a URL already in
+  the environment. The effects of these calls are ordinary; only the provenance of their arguments
+  shows they came from the attacker. Catching them needs data-flow tracking (CaMeL, FIDES), which
+  this guard does not have.
+- **"Of calls that ran" is not AgentDojo's number.** Slack's injection_task_5 is scored on the calls
+  the agent *attempted*. The guard refused the invitation and Fred never joined, but AgentDojo still
+  counts the attack. The official number is kept, and this column scores that one task on the calls
+  that ran.
+- **The cost is 3 of 97 user tasks.** Each one hands money, a web post or a Slack invitation to a party
+  the user did not name, taken from a file, an email or a web page.
+- **Arbitration.** Across 4,275 calls the witness agreed with the guard every time. The first full
+  run told a different story: 665 disagreements. AgentDojo stamps mail and files with the current
+  time, so two runs of the same call differ. That run lost 24 user tasks to it, and some attacks
+  were "stopped" for that reason and no other. The clock is now an input that both runs share, so any
+  disagreement left means something else differed.
+
+The policy was written from the suites' tools, schema and user prompts, not from the injection
+tasks, and was not changed after seeing results. CI re-runs the first user task of each suite
+against every injection task, and it must reproduce the committed results.
+
 ## Is the jail really containing anything?
 
     python3 containment_mutants.py

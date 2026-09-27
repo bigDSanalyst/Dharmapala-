@@ -52,3 +52,20 @@ jobs:
         run: python3 containment_mutants.py
       - name: Every containment mutant caught (as root)
         run: sudo env "PATH=$PATH" python3 containment_mutants.py
+  # The guard on AgentDojo's own suites (agentdojo_guard.py, eval_agentdojo.py).
+  # Its own job, so the main suite does not carry AgentDojo's dependencies.
+  # DHARMA_REQUIRE_AGENTDOJO makes a missing agentdojo a failure, not a skip,
+  # and the committed results (results/agentdojo-default.json) are re-run for
+  # the first user task of each suite and must come out the same.
+  agentdojo:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y coq
+      - run: pip install -r requirements.txt pytest agentdojo==0.1.35
+      - run: pytest -q tests/test_agentdojo_guard.py
+        env:
+          DHARMA_REQUIRE_AGENTDOJO: "1"

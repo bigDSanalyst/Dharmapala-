@@ -20,6 +20,11 @@
 #   - every entry that ran is one the ledger signed, with the verdict it says
 #   - every run the ledger signed has an entry: none dropped from the end
 #
+# Two kinds of entry are not calls but notes (outcome "note"): the
+# differences shown to the model in a reconcile turn, and whether its answer
+# agreed with the record afterwards (guarded_agent._run). They are in the
+# chain like any entry; they carry no run record and the ledger signs none.
+#
 # A call whose output was withheld from the model is not written in full
 # either: what it read is exactly what must not leave, and a file on disk is
 # one more way out. Its entry keeps the digest, which the ledger still signs.
@@ -139,6 +144,8 @@ def account(entries):
                 line = f"ran {what} -> exit {result.get('returncode')}, printed {_show(result.get('stdout', ''))}"
             else:
                 line = f"did not fetch {what} (the sandbox has no network)"
+        elif outcome == "note":
+            line = f"{tool}: {e.get('detail', '')}"
         elif e.get("withheld") or (e.get("evidence_digest") and outcome != "lawful"):
             line = f"{tool} {what}: ran contained, {outcome}; output withheld from the model"
         else:

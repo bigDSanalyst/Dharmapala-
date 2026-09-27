@@ -30,6 +30,11 @@ Every call it proposes goes through the same gate, whichever model it is:
                    output is withheld: what it read is exactly what must not
                    leave, and the model is where it would go.
 
+After the run, the model's answer is checked against the run record
+(answer_check.py). If they differ, the model is shown where, once, and may
+correct its answer or finish the work (the reconcile turn); its calls go
+through the same gate and its new answer is checked again.
+
 The anthropic backend needs the anthropic package and credentials
 (ANTHROPIC_API_KEY, or a profile from `ant auth login`). The openai-compatible
 backend needs only the server's URL, and a key if the server wants one (read
@@ -74,6 +79,15 @@ vow GuardedAgent
   forbid network_unlisted forall action
   forbid diverged forall action
 """
+
+RECONCILE = """Your answer and the run record of what your tool calls did do not agree:
+{differences}
+
+What the record shows, call by call:
+{account}
+
+The record is what happened. Either correct your answer to match it, or finish the work so \
+that it does; any call you make is checked like every other. Then give your final answer again."""
 
 SYSTEM = """You are working in a sandboxed directory. Every tool call you make is \
 checked by a guard before it runs and judged again after. A call can be refused \
@@ -194,6 +208,19 @@ class GuardedAgent:
     def run(self, task):
         """Returns (finished, final_text or the reason it stopped)."""
         self.backend.start(task)
+        return self._loop()
+
+    def reconcile(self, differences, account):
+        """One more turn, once: the model is shown where its answer and the
+        run record differ, and what the record shows, and may correct its
+        answer or finish the work. Every call it makes goes through the gate
+        like any other. What it says afterwards is a claim like the first
+        answer, and is checked the same way. Returns what run() returns."""
+        self.backend.say(RECONCILE.format(differences="\n".join("- " + d for d in differences),
+                                          account="\n".join("- " + a for a in account)))
+        return self._loop()
+
+    def _loop(self):
         for _ in range(self.max_turns):
             turn = self.backend.step()
             if turn.stop == backends.REFUSAL: return False, "the model declined the task"
@@ -227,6 +254,8 @@ def main(argv=None):
     ap.add_argument("--runs", help="write the run records here (default: next to the ledger, "
                                    "LEDGER.runs.jsonl; without a ledger, kept in memory)")
     ap.add_argument("--max-turns", type=int, default=20)
+    ap.add_argument("--no-reconcile", action="store_true",
+                    help="do not show the model where its answer and the record differ")
     ap.add_argument("--backend", choices=["anthropic", "openai-compatible"], default="anthropic")
     ap.add_argument("--model", help=f"default {MODEL} for anthropic; required for openai-compatible")
     ap.add_argument("--base-url", help="openai-compatible: the server's API root, e.g. http://localhost:8000/v1")
@@ -263,13 +292,13 @@ def main(argv=None):
     if args.backend == "openai-compatible":
         backend = backends.OpenAICompatibleBackend(args.base_url, args.model, SYSTEM, TOOLS,
                                                    api_key=os.environ.get(args.api_key_env))
-        try: finished, text = GuardedAgent(backend, gate, max_turns=args.max_turns).run(args.task)
+        try: finished, text, first = _run(GuardedAgent(backend, gate, max_turns=args.max_turns), gate, args)
         except backends.BackendError as e:
             print(str(e), file=sys.stderr); return 1
-        return _report(gate, ledger, pol, workdir, args, finished, text)
+        return _report(gate, ledger, pol, workdir, args, finished, text, first)
     try:
         agent = GuardedAgent(anthropic.Anthropic(), gate, model=args.model or MODEL, max_turns=args.max_turns)
-        finished, text = agent.run(args.task)
+        finished, text, first = _run(agent, gate, args)
     except anthropic.AuthenticationError as e:
         print(f"the API refused the credentials: {e}", file=sys.stderr); return 1
     except anthropic.APIStatusError as e:
@@ -283,7 +312,7 @@ def main(argv=None):
         # TypeError is a bug and is not swallowed here.
         if "authentication method" not in str(e): raise
         print("no API credentials: set ANTHROPIC_API_KEY or run `ant auth login`", file=sys.stderr); return 1
-    return _report(gate, ledger, pol, workdir, args, finished, text)
+    return _report(gate, ledger, pol, workdir, args, finished, text, first)
 
 def tool_calls_in_text(text):
     """Tool calls the model wrote into its answer as text instead of making
@@ -306,9 +335,33 @@ def tool_calls_in_text(text):
         found.append(("?", None))
     return found
 
-def _report(gate, ledger, pol, workdir, args, finished, text):
+def _run(agent, gate, args):
+    """Run the task; if the answer and the record differ, reconcile once.
+    Returns (finished, final text, the first answer and its differences or None).
+    Both the differences shown and the check of the answer that follows are
+    entries in the run record, beside the calls."""
+    finished, text = agent.run(args.task)
+    if not finished or getattr(args, "no_reconcile", False): return finished, text, None
+    differ = answer_check.differences(text, gate.runs.this_run)
+    if not differ: return finished, text, None
+    account = runs.account(gate.runs.this_run)
+    gate.runs.add("", "reconcile", {"differences": differ}, "note", "shown to the model, once")
+    first = {"answer": text, "differences": differ}
+    finished, text = agent.reconcile(differ, account)
+    after = answer_check.differences(text, gate.runs.this_run) if finished else None
+    gate.runs.add("", "recheck", {"differences": after}, "note",
+                  "did not finish" if after is None else "agrees with the record" if not after
+                  else f"{len(after)} difference(s) remain")
+    return finished, text, first
+
+def _report(gate, ledger, pol, workdir, args, finished, text, first=None):
     for name, a, outcome, detail in gate.log:
         print(f"  {outcome:16s} {name} {json.dumps(a)[:100]}")
+    if first:
+        print("first answer:\n" + first["answer"])
+        print("\nwhere it differed from the record (shown to the model, once):")
+        for line in first["differences"]: print("  " + line)
+        print("\nanswer after reconciling:")
     print(text)
     written = tool_calls_in_text(text)
     if written:
@@ -320,8 +373,10 @@ def _report(gate, ledger, pol, workdir, args, finished, text):
     for line in runs.account(gate.runs.this_run) or ["(no calls)"]: print("  " + line)
     differ = answer_check.differences(text, gate.runs.this_run) if finished else []
     if differ:
-        print("\nwhere the answer and the record differ:")
+        print("\nwhere the answer and the record differ" + (" (still, after reconciling):" if first else ":"))
         for line in differ: print("  " + line)
+    elif first and finished:
+        print("\nafter reconciling, the answer and the record agree where they can be compared")
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
           + (f"  runs: {gate.runs.path}" if gate.runs.path else "")
           + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")

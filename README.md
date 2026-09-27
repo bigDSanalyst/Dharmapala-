@@ -77,13 +77,19 @@ call(s) as text instead of making them (file_read notes.txt); they were not
 run`. Nothing written that way is ever run.
 
 Where the answer and the record can be compared exactly, the report says so
-under `where the answer and the record differ:`. Two cases are checked:
+under `where the answer and the record differ:`. Three cases are checked:
 
 - `content`: the answer shows a file's contents (a fenced block, or a block
   after a line such as "notes.txt contains:"), but the record shows the file
   last as something else.
 - `omitted`: the gate stopped calls, and the answer mentions neither what they
   touched nor any refusal.
+- `underclaim`: the answer says it could not read a file, or that reading was
+  blocked, but the record shows the read succeeded. A sentence that names files
+  is checked for those files. A sentence that names none ("the files were
+  blocked") is checked for every file that was read and is never named in the
+  answer. In one live run, a 7B model had `.env` refused and `readme.txt` read,
+  then said reading "the files" was blocked.
 
 Prose descriptions and anything after a lawful shell call, which may have
 changed any file, are not checked. No model is asked to judge, and the report

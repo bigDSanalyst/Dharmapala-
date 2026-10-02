@@ -30,6 +30,10 @@
 #   5. commit     only a lawful call's copy becomes the environment. A refused
 #                 call leaves the environment as it was: nothing half-done.
 #
+# A book of lessons (lessons.py), if the gate is given one, is read after
+# step 4 and only for a lawful call: it can refuse what the guard allowed,
+# never allow what the guard refused. Without one, nothing here changes.
+#
 # A party is trusted if it is the user's own identity, appears in a party
 # field of the environment when the task began, or is named in the user's
 # prompt. Nothing here knows about any injection task; the policy was written
@@ -215,7 +219,7 @@ class _FrozenClock:
 
 class StateGate:
     """Everything between a proposed call and the environment it would change."""
-    def __init__(self, vow_source=AGENTDOJO_VOW, policy=None, ledger=None, formatter=None):
+    def __init__(self, vow_source=AGENTDOJO_VOW, policy=None, ledger=None, formatter=None, lessons=None):
         from guard import Guard
         from ledger import Ledger
         from signing import default_signer, verifier_for
@@ -237,6 +241,11 @@ class StateGate:
         self.binary_path = me
         self.binary_hash = hashlib.sha256(open(me, "rb").read()).hexdigest()
         self.formatter = formatter
+        if lessons is not None and not hasattr(lessons, "check"):
+            from lessons import Lessons
+            lessons = Lessons.load(lessons)
+        self.lessons = lessons
+        self.calls = []        # this task's calls as proposed, with their outcomes: what a lesson is learned from
         self.prompt, self.trusted = "", set()
         self.log = []          # one record per call: how it was arbitrated
         self.ran, self.pre_env, self.post_env = [], None, None   # this task's calls that ran, and its states
@@ -245,7 +254,7 @@ class StateGate:
         """A task starts: what the user asked, and who is already known."""
         self.prompt = prompt
         self.trusted = trusted_parties(self.policy, env.model_dump(mode="json"))
-        self.task_start, self.ran = len(self.log), []
+        self.task_start, self.ran, self.calls = len(self.log), [], []
         self.pre_env = env.model_copy(deep=True)
 
     def _fmt(self, result):
@@ -256,6 +265,13 @@ class StateGate:
     def call(self, runtime, env, name, args, call_id=""):
         """(text, error, env): the result to show the model, the error if any (a refusal is one,
         so the model is told), and the environment after the call."""
+        out = self._call(runtime, env, name, args, call_id)
+        rec = self.log[-1]
+        self.calls.append({"tool": name, "args": json.loads(json.dumps(dict(args), default=str)),
+                           "changes": rec["changes"], "outcome": rec["outcome"]})
+        return out
+
+    def _call(self, runtime, env, name, args, call_id):
         from guard import VerdictKind
         import datetime
         before = env.model_dump(mode="json")
@@ -294,6 +310,14 @@ class StateGate:
         rec["verdict"] = verdict.kind.name
         # 5. Only a lawful call's change is kept.
         if verdict.kind == VerdictKind.LAWFUL:
+            # A lesson can refuse what the guard allowed; it is never asked about a refusal.
+            hit = self.lessons.check(name, dict(args), self.prompt) if self.lessons is not None else None
+            if hit is not None:
+                lesson, token = hit
+                rec.update(outcome="refused", lesson=lesson["id"], lessons=self.lessons.hash()); self.log.append(rec)
+                msg = (f"refused: lesson {lesson['id']}: {lesson['kind']} {token!r} in {name}.{lesson['arg']} "
+                       f"was not named by the user (learned from {lesson['learned_from']}); nothing was changed")
+                return msg, msg, env
             rec["outcome"] = "lawful"; self.log.append(rec)
             return text, error, staged
         rec["outcome"] = "refused"; self.log.append(rec)

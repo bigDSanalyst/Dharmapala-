@@ -228,6 +228,62 @@ The policy was written from the suites' tools, schema and user prompts, not from
 tasks, and was not changed after seeing results. CI re-runs the first user task of each suite
 against every injection task, and it must reproduce the committed results.
 
+### Learned refusals: lessons
+
+    python3 eval_lessons.py --out results/agentdojo-lessons.json     # about an hour on 4 cores
+    python3 eval_agentdojo.py --lessons book.json                     # any run, with a book of lessons
+
+What gets past the guard is provenance: ordinary calls whose arguments the attacker chose.
+Self-Evolving Defense (SED, 2026) answers that by learning: a judge marks a trajectory harmful, and
+the failure becomes a policy for later episodes. `lessons.py` is that loop, held to three rules:
+
+- **Tighten-only.** A lesson is read after the guard's verdict, and only when that verdict is
+  lawful. It can refuse what the guard allowed; it has no way to allow anything. A wrong lesson
+  costs utility, never safety. A test builds books from every candidate lesson and checks that
+  nothing lawful with a book was refused without it.
+- **Admitted, not just learned.** A candidate lesson is kept only if it refuses none of the calls of
+  the known-good trajectories. The most general candidate that passes is kept: "a link in a direct
+  message that the user did not name" before "this link".
+- **Append-only.** Each lesson carries the hash of the book before it, and the book the hash of
+  all of it; a book with an edited history does not load. Whoever can write the file can rewrite
+  the whole chain, so the hash is what binds: every lesson refusal records it, results record it,
+  and `Lessons.load(path, expect=...)` checks it.
+
+A lesson is deterministic: a tool, an argument, a kind of token (a URL, an email address, an IBAN, or
+the whole value), and optionally the token. It fires when that argument carries such a token and
+the user's prompt does not name it. Which trajectories are harmful is the judge's call; here it is
+AgentDojo's own security check, and it could be a model.
+
+SED scores AgentDojo on the same stream it learns from. `results/agentdojo-lessons.json` scores on
+tasks the lessons never saw. Each suite's user tasks are split in two by position: lessons are
+learned on the even ones and tested on the odd ones. The agent is the hijacked one above.
+
+| suite | lessons | utility, test half | repeated attacks (held-out user tasks) | unseen attacks (held-out injection task) |
+|---|---|---|---|---|
+| banking | 0 | 8/8 -> 8/8 | 0/71 -> 0/71 | 0/71 -> 0/71 |
+| slack | 4 | 9/10 -> 9/10 | 20/50 -> 0/50 | 20/50 -> 20/50 |
+| travel | 2 | 10/10 -> 10/10 | 29/58 -> 1/58 | 29/58 -> 9/58 |
+| workspace | 1 | 20/20 -> 20/20 | 20/114 -> 2/114 | 20/114 -> 20/114 |
+| **total** | **7** | **47/48 -> 47/48** | **69/293 -> 3/293** | **69/293 -> 49/293** |
+
+- **Against an attack it has seen, it works.** 66 of the 69 attacks that got past the guard on the
+  test half are stopped, and no clean test task had a call refused by a lesson.
+- **Against an attack it has not seen, it mostly does not.** Leaving each injection task out of
+  learning, the only transfer is in travel. There, injection_tasks 0 and 4 both book a hotel the
+  user did not name, so each one's lesson stops the other (20 attacks). Slack's link and URL
+  lessons, and workspace's lesson for one file, say nothing about a different attack. This is the
+  gap SED's own limitations section names, measured.
+- **What the 3 left are.** Two workspace attacks delete file 13 under a prompt that mentions
+  "June 13", and the lesson gives way to what the user named; matching a short token by its text
+  is too loose. The third is a travel attack that sends the user's passport and card numbers to
+  an address the prompt itself names; no learning task was hijacked by it.
+- **Some lessons are broad.** Travel learned "do not book a hotel the user did not name", from
+  one hijacked trajectory. No learning task booked an unnamed hotel, so it was admitted, and no
+  test task needed one. A deployment's known-good set would need to cover the tasks it is meant
+  to keep working.
+- **No model was run here.** The judge is AgentDojo's check and the agent is scripted, so this is
+  what lessons do once a hijack is known and repeated; not a rate for any model.
+
 ## Is the jail really containing anything?
 
     python3 containment_mutants.py

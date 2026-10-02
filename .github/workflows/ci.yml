@@ -56,7 +56,9 @@ jobs:
   # Its own job, so the main suite does not carry AgentDojo's dependencies.
   # DHARMA_REQUIRE_AGENTDOJO makes a missing agentdojo a failure, not a skip,
   # and the committed results (results/agentdojo-default.json) are re-run for
-  # the first user task of each suite and must come out the same.
+  # the first user task of each suite and must come out the same. A lesson
+  # learned on one slack task must stop the same attack on another
+  # (tests/test_lessons.py).
   agentdojo:
     runs-on: ubuntu-24.04
     steps:
@@ -66,6 +68,6 @@ jobs:
           python-version: '3.11'
       - run: sudo apt-get update && sudo apt-get install -y coq
       - run: pip install -r requirements.txt pytest agentdojo==0.1.35
-      - run: pytest -q tests/test_agentdojo_guard.py
+      - run: pytest -q tests/test_agentdojo_guard.py tests/test_lessons.py
         env:
           DHARMA_REQUIRE_AGENTDOJO: "1"

@@ -26,6 +26,7 @@ the guard too; that baseline is what shows each attack is real.
     python3 eval_agentdojo.py                      # all suites, results to stdout
     python3 eval_agentdojo.py --out results/agentdojo.json --vow strict
     python3 eval_agentdojo.py --model qwen2.5:7b --base-url http://localhost:11434/v1 --suites banking --limit 4
+    python3 eval_agentdojo.py --lessons book.json      # with a book of learned refusals (lessons.py)
 
 Needs `pip install agentdojo` (tested with 0.1.35)."""
 import argparse, collections, json, sys, time
@@ -92,9 +93,10 @@ def effective(injection_task, gate, hit):
     got = injection_task.security_from_traces("", gate.pre_env, gate.post_env, list(gate.ran))
     return hit if got is None else bool(got)
 
-def evaluate(suites=None, vow="default", limit=None, version=VERSION, progress=None, agent=None):
+def evaluate(suites=None, vow="default", limit=None, version=VERSION, progress=None, agent=None, lessons=None):
     """agent: None plays the ground truth (see above); a factory from
-    model_agent() runs a real model, whose every call the guard judges."""
+    model_agent() runs a real model, whose every call the guard judges.
+    lessons: a book of learned refusals (lessons.py) for the guarded runs."""
     make = agent or _pipeline
     import warnings
     from agentdojo.agent_pipeline.tool_execution import ToolsExecutor
@@ -104,9 +106,13 @@ def evaluate(suites=None, vow="default", limit=None, version=VERSION, progress=N
     vow_source = ag.STRICT_VOW if vow == "strict" else ag.AGENTDOJO_VOW
     out = {"agentdojo_version": version, "attack": ATTACK, "vow": vow, "policy_hash": ag.StatePolicy.load().hash(),
            "agent": "ground truth (scripted)" if agent is None else "model", "suites": {}}
+    if lessons is not None:
+        from lessons import Lessons
+        if not isinstance(lessons, Lessons): lessons = Lessons.load(lessons)
+        out["lessons_hash"] = lessons.hash()
     for sname, suite in get_suites(version).items():
         if suites and sname not in suites: continue
-        gate = ag.StateGate(vow_source=vow_source)
+        gate = ag.StateGate(vow_source=vow_source, lessons=lessons)
         guarded = ag.executor(gate)
         plain = ToolsExecutor()
         attack = load_attack(ATTACK, suite, make(None, None, plain, "local"))
@@ -176,6 +182,8 @@ def combine(parts):
     for p in parts:
         for k in ("agentdojo_version", "attack", "vow", "policy_hash"):
             if p[k] != out[k]: raise ValueError(f"cannot combine runs with different {k}")
+        if p.get("lessons_hash") != out.get("lessons_hash"):
+            raise ValueError("cannot combine runs with different lessons")
         out["suites"].update(p["suites"])
     t = out["suites"].values()
     out["total"] = {k: sum(s[k] for s in t) for k in parts[0]["total"]}
@@ -192,6 +200,7 @@ def main(argv=None):
     ap.add_argument("--model", help="run a real model instead of the ground truth (needs --base-url)")
     ap.add_argument("--base-url", help="an OpenAI-compatible server, e.g. http://localhost:11434/v1 for Ollama")
     ap.add_argument("--api-key-env", default="OPENAI_API_KEY", help="environment variable holding the key, if any")
+    ap.add_argument("--lessons", help="a book of learned refusals (lessons.py) for the guarded runs")
     args = ap.parse_args(argv)
     if args.combine:
         r = combine([json.load(open(f)) for f in args.combine])
@@ -209,7 +218,7 @@ def main(argv=None):
         import os
         agent = model_agent(args.model, args.base_url, os.environ.get(args.api_key_env))
     t0 = time.time()
-    r = evaluate(args.suites, args.vow, args.limit, agent=agent,
+    r = evaluate(args.suites, args.vow, args.limit, agent=agent, lessons=args.lessons,
                  progress=lambda s, u: print(f"  {s} {u}", file=sys.stderr, flush=True))
     if agent is not None: r["model"] = args.model
     r["seconds"] = round(time.time() - t0)

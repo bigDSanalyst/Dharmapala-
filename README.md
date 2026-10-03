@@ -267,6 +267,27 @@ guard and once with it. The totals are the sums of each file's `total`.
   their files), after qwen generated without stopping earlier in the travel run. A reply cut short
   is scored as the model's answer, with and without the guard alike.
 
+### Tried and not merged: learning from failures
+
+What gets past the guard is provenance: ordinary calls whose arguments the attacker chose.
+Self-Evolving Defense (SED, 2026) answers that by learning: a judge marks a run harmful, and the
+failure becomes a rule for later runs. We built that loop as a layer that could only add refusals
+(PR #22), and measured it on tasks it never saw. It learned on the even user tasks of each suite
+and was tested on the odd ones, with the hijacked agent above:
+
+| | before | with learned rules |
+|---|---|---|
+| attacks it had seen on other tasks | 69/293 got through | 3/293 |
+| attacks it had never seen | 69/293 | 49/293 |
+| utility, test tasks | 47/48 | 47/48 |
+
+It stops repeated attacks and barely touches new ones; the 20 it did stop were two travel attacks
+that book a hotel the user did not name, each teaching the rule that stops the other. It was not
+merged. Its refusals sit outside the certified verdict, a deployed judge would be a model the guard
+has to trust, and the rule book and its known-good set become things to protect in their own
+right. The code and results are kept on the branch `claude/unified-math-framework-uusi3z-lessons`
+(`lessons.py`, `eval_lessons.py`, `results/agentdojo-lessons.json`).
+
 ## Is the jail really containing anything?
 
     python3 containment_mutants.py

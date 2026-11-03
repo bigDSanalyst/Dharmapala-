@@ -1,0 +1,105 @@
+# The AgentDojo evaluation (eval_agentdojo.py), run by hand: Actions ->
+# AgentDojo -> Run workflow. It runs nothing on push. Each suite runs in its
+# own job; the last job combines them and puts the table on the run's page,
+# and the full results are attached to the run as agentdojo-results.
+name: AgentDojo
+
+on:
+  workflow_dispatch:
+    inputs:
+      vow:
+        description: Vow
+        type: choice
+        options: [default, strict]
+        default: default
+      policy:
+        description: State policy (agentdojo-v1 is the one before trust came only from the user)
+        type: choice
+        options: [agentdojo, agentdojo-v1]
+        default: agentdojo
+      attacker_known:
+        description: The attacker has already emailed or paid the user (workspace, travel and banking)
+        type: boolean
+        default: false
+      limit:
+        description: Only the first N user tasks of each suite (empty for all)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      suites: ${{ steps.suites.outputs.suites }}
+    steps:
+      - id: suites
+        env:
+          KNOWN: ${{ inputs.attacker_known }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          if [ -n "$LIMIT" ] && ! [[ "$LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "limit must be a whole number, not '$LIMIT'" >&2; exit 1
+          fi
+          # The known-attacker test seeds an email or a payment; Slack has neither.
+          if [ "$KNOWN" = "true" ]; then s='["banking","travel","workspace"]'
+          else s='["banking","slack","travel","workspace"]'; fi
+          echo "suites=$s" >> "$GITHUB_OUTPUT"
+
+  suite:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.plan.outputs.suites) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y coq
+      - run: pip install -r requirements.txt agentdojo==0.1.35
+      - name: Run ${{ matrix.suite }}
+        env:
+          SUITE: ${{ matrix.suite }}
+          VOW: ${{ inputs.vow }}
+          POLICY: ${{ inputs.policy }}
+          KNOWN: ${{ inputs.attacker_known }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          args=(--suites "$SUITE" --vow "$VOW" --policy "policies/$POLICY.json" --out "out/$SUITE.json")
+          [ "$KNOWN" = "true" ] && args+=(--attacker-known)
+          [ -n "$LIMIT" ] && args+=(--limit "$LIMIT")
+          mkdir -p out
+          python3 eval_agentdojo.py "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: agentdojo-${{ matrix.suite }}
+          path: out/
+
+  combine:
+    needs: suite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          pattern: agentdojo-*
+          merge-multiple: true
+          path: out
+      - name: Table
+        run: |
+          python3 eval_agentdojo.py --combine out/*.json --out agentdojo.json > table.txt
+          cat table.txt
+          { echo '```'; cat table.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: agentdojo-results
+          path: agentdojo.json

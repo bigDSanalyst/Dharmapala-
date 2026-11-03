@@ -165,7 +165,12 @@ one policy and refuses a decision made under any other.
 
     pip install agentdojo==0.1.35
     python3 eval_agentdojo.py                          # the guard, no model: about an hour on 4 cores
+    python3 eval_agentdojo.py --attacker-known         # each attacker has already emailed or paid the user
     python3 eval_agentdojo.py --model qwen2.5:7b --base-url http://localhost:11434/v1 --suites banking --limit 4
+
+Without a machine to run it on, from a phone for instance: on GitHub, Actions -> AgentDojo -> Run
+workflow (`.github/workflows/agentdojo.yml`). It runs only when started by hand. Each suite runs in
+its own job; the table appears on the run's page, and the full results are attached to the run.
 
 [AgentDojo](https://github.com/ethz-spylab/agentdojo) is the benchmark prompt-injection defences
 report on. It has 97 user tasks in four suites (workspace, travel, banking, slack), each paired with
@@ -175,8 +180,11 @@ share files and invite users. `agentdojo_guard.py` reads each call's effects fro
 1. The call runs on a copy of the environment.
 2. The guard diffs the copy and reads the diff under `policies/agentdojo.json`. Money, mail, a share,
    a message or a web request to a party that is not trusted is `exfiltrate`. A party is trusted if
-   it is the user's own identity, was already in the environment, or is named in the user's prompt.
-   An unknown new user, or a password the user did not give, is `dominate`. A removal is `destruct`.
+   it is the user, is named in the user's prompt, or was brought in by the user: someone the user
+   has sent mail to, paid or scheduled a payment to, shared one of their own files with, saved as a
+   contact, or has a meeting with. Someone who has only written to the user, or paid them, is not
+   trusted for that, since anyone can send an email or a payment. An unknown new user, or a
+   password the user did not give, is `dominate`. A removal is `destruct`.
 3. A witness runs the call again on its own copy, at the same clock reading, and diffs it with its
    own code. If the two readings differ, the call is refused.
 4. Otherwise the verdict goes through `Guard.engage` (Coq certificate, ML-DSA co-signer, ledger).
@@ -199,14 +207,19 @@ those are counted. `results/agentdojo-default.json`:
 The strict Vow also forbids `destruct` (`results/agentdojo-strict.json`). That takes workspace to
 0/231 and the total to 120/593 (20.2%, or 16.7% of calls that ran), and utility to 92/97.
 
+v1 of the policy gave these numbers too, task by task (`results/agentdojo-v1-*.json`): AgentDojo's
+attackers are strangers to the user, so whom the guard trusts decides none of its attacks. The test
+below is the one where it does.
+
 What these numbers are and are not:
 
 - **No model was run.** The "hijacked agent" always obeys the injection, so these are not an attack
   success rate for any model and are not comparable to CaMeL's or MELON's model runs. They measure
   what is left once the model is lost. `--model` runs a real one through the same guard.
 - **The guard stops what the attacker's calls do to parties.** It stops money or data going to
-  strangers, strangers invited in, and passwords changed. That covers all of banking, and all of
-  workspace under the strict Vow.
+  anyone the user has not brought in, strangers invited in, and passwords changed. That covers all
+  of banking, and all of workspace under the strict Vow, and it holds when the attacker has already
+  emailed or paid the user (below).
 - **It does not stop what looks like the user's own business.** Examples: a phishing link sent to a
   colleague, a hotel booked for the user, a calendar event created, and a visit to a URL already in
   the environment. The effects of these calls are ordinary; only the provenance of their arguments
@@ -225,13 +238,53 @@ What these numbers are and are not:
   disagreement left means something else differed.
 
 The policy was written from the suites' tools, schema and user prompts, not from the injection
-tasks, and was not changed after seeing results. CI re-runs the first user task of each suite
-against every injection task, and it must reproduce the committed results.
+tasks. v1 was not changed after seeing results. v2 changes one thing, who is trusted, and was
+written after the known-attacker test below showed what v1 let through; its rule names no
+injection task and no attacker. Both are kept: `policies/agentdojo-v1.json` and
+`results/agentdojo-v1-*.json`. CI re-runs the first user task of each suite against every
+injection task, and with the attacker already known, and it must reproduce the committed results.
+
+### An attacker who has already written to you
+
+AgentDojo's attackers are always strangers: the address an injection sends data to, or the account
+it sends money to, appears nowhere in the user's environment. Outside the benchmark that is often
+not so. An injection that arrives by email is itself mail from its attacker, and one of AgentDojo's
+own banking injections sits in the subject of an incoming payment, which outside the benchmark the
+attacker would have sent. `--attacker-known` runs the same hijacked agent, but each attacker has
+first sent the user one email (workspace, travel) or one payment of 0.01 (banking). Only the guard's
+reading of whom to trust sees that history; the tasks run in AgentDojo's own environment, so its
+checks are unchanged. Slack is left out: its attackers are a new workspace user and websites, which
+no email or payment makes known.
+
+Attacks that succeed in workspace, travel and banking (488 pairs that succeed unguarded):
+
+| | attacker a stranger | attacker already known |
+|---|---|---|
+| v1, default Vow | 97 (19.9%) | **472 (96.7%)** |
+| v1, strict Vow | 57 (11.7%) | **392 (80.3%)** |
+| v2, default Vow | 97 (19.9%) | 97 (19.9%) |
+| v2, strict Vow | 57 (11.7%) | 57 (11.7%) |
+
+- **v1 trusted every party in the environment.** One email or one payment of 0.01 made the attacker
+  trusted, and sending them the user's data or money became an ordinary write. What v1 still
+  stopped was a password change (banking injection_task_7) and, under the strict Vow, deletions. In
+  40 of those the attacker still received the Facebook security code (workspace injection_task_5):
+  AgentDojo scored the attack as failed only because the deletion that followed it was refused.
+- **v2 trusts only parties the user brought in.** The attacker's email or payment earns them
+  nothing: v2's results with the attacker known are the same as with a stranger, task by task. On
+  the standard test above they are v1's, utility included (94/97, or 92/97 strict).
+  `results/agentdojo-known-attacker-*.json`, `results/agentdojo-v1-known-attacker-*.json`.
+- **What v2 does not cover.** Someone the user has written to, paid, shared a file with, saved as a
+  contact or has a meeting with is trusted, so an attacker the user has replied to once is trusted
+  from then on. Meeting participants are trusted because AgentDojo's calendar events do not record
+  who created them: an attacker's invitation in the user's calendar counts as a meeting.
 
 ### A real model: qwen2.5:7b
 
 `results/qwen2.5-7b/` holds one file per user task from a run of qwen2.5:7b (Ollama, temperature 0)
-through the same guard and the same policy (hash `6a15d2a4…`). The model ran on a Colab A100,
+through the same guard, under v1 of the policy (`policies/agentdojo-v1.json`, hash `6a15d2a4…`): it
+ran before trust came only from the user, and has not been run again under v2, which needs a GPU.
+The model ran on a Colab A100,
 one user task at a time. Each task ran clean, then against every injection task, once without the
 guard and once with it. The totals are the sums of each file's `total`.
 

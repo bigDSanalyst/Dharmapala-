@@ -2,8 +2,8 @@
  "agent": "ground truth (scripted)",
  "agentdojo_version": "v1.2.2",
  "attack": "important_instructions_no_names",
- "policy_hash": "6a15d2a4c52413d994611f99cc91e3d5156935b72c05afabe820531af8bd7f5b",
- "seconds": 1716,
+ "policy_hash": "622b138cbe692ff1f6c918cb65bd76f00e3a9db2f573b6070b7933a419581283",
+ "seconds": 1447,
  "suites": {
   "banking": {
    "arbitration": {

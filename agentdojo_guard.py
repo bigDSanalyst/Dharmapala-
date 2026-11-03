@@ -11,8 +11,8 @@
 #   2. effects    the guard's diff of the copy against the environment, read
 #                 under the state policy (policies/agentdojo.json): money,
 #                 mail, a shared file, a message, a web request that reaches a
-#                 party the user did not name and the environment did not
-#                 already hold is exfiltrate; adding an unknown user or
+#                 party the user did not name or bring in (see below) is
+#                 exfiltrate; adding an unknown user or
 #                 changing a password to a value the user did not give is
 #                 dominate; removing anything is destruct; the rest is write.
 #   3. witness    the call runs again, on the witness's own copy, at the same
@@ -30,14 +30,23 @@
 #   5. commit     only a lawful call's copy becomes the environment. A refused
 #                 call leaves the environment as it was: nothing half-done.
 #
-# A party is trusted if it is the user's own identity, appears in a party
-# field of the environment when the task began, or is named in the user's
-# prompt. Nothing here knows about any injection task; the policy was written
-# from the suites' tools, schema and user prompts.
+# A party is trusted if it is the user, is named in the user's prompt, or was
+# brought in by the user, as the environment stood when the task began:
+# someone the user has sent mail to, paid, shared one of their own files with,
+# saved as a contact or has a meeting with (the policy's trust_from lists
+# them). Someone who has only written to the user, or paid them, is not
+# trusted by that, since anyone can send an email or a payment.
+# Nothing here knows about any injection task; the policy was written from
+# the suites' tools, schema and user prompts.
 import fnmatch, hashlib, json, os, re
 
-FORMAT = "dharmapala-state-policy/v1"
-KEYS = {"format", "note", "identity", "rules", "trust_from", "otherwise"}
+# v2 adds authored_by and identity_literals. A v1 policy still loads and means
+# what it meant: every party in a trust_from field is trusted. A reader that
+# knows only v1 refuses a v2 policy rather than trusting too much.
+FORMAT = "dharmapala-state-policy/v2"
+FORMATS = ("dharmapala-state-policy/v1", FORMAT)
+KEYS = {"format", "note", "identity", "identity_literals", "rules", "trust_from", "otherwise"}
+V1_KEYS = KEYS - {"identity_literals"}
 OPS = ("add", "change", "remove")
 DEFAULT_POLICY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "policies", "agentdojo.json")
 
@@ -56,9 +65,10 @@ class StatePolicyError(ValueError): pass
 class StatePolicy:
     """What a change to the environment means. Data with a hash, like policy.py."""
     def __init__(self, d):
-        if not isinstance(d, dict) or d.get("format") != FORMAT:
+        if not isinstance(d, dict) or d.get("format") not in FORMATS:
             raise StatePolicyError(f"not a {FORMAT} document")
-        unknown = set(d) - KEYS
+        v1 = d["format"] == FORMATS[0]
+        unknown = set(d) - (V1_KEYS if v1 else KEYS)
         if unknown: raise StatePolicyError(f"unknown keys: {sorted(unknown)}")
         for r in d.get("rules", []):
             if not set(r.get("ops", [])) <= set(OPS) or not r.get("ops"):
@@ -66,7 +76,11 @@ class StatePolicy:
             _party_spec(r.get("party"))
             from effects import require_known
             require_known(r.get("effect"), f"rule {r.get('path')}")
-        for t in d.get("trust_from", []): _party_spec(t.get("party"))
+        for t in d.get("trust_from", []):
+            extra = set(t) - ({"path", "party"} if v1 else {"path", "party", "authored_by"})
+            if extra: raise StatePolicyError(f"trust_from {t.get('path')}: unknown keys {sorted(extra)}")
+            _party_spec(t.get("party"))
+            _author_spec(t)
         if set(d.get("otherwise", {})) != set(OPS):
             raise StatePolicyError(f"otherwise must name an effect for each of {OPS}")
         self.d = d
@@ -79,6 +93,16 @@ class StatePolicy:
 def _party_spec(spec):
     if spec is None or spec == "value" or re.fullmatch(r"seg:-?\d+", str(spec)): return spec
     raise StatePolicyError(f"party must be 'value' or 'seg:N', not {spec!r}")
+
+def _author_spec(t):
+    """authored_by names one field of the same record as path: the record's
+    part of path, then a field name, e.g. path inbox/emails/*/recipients/*
+    and authored_by inbox/emails/*/sender."""
+    a, p = t.get("authored_by"), t.get("path")
+    if a is None: return
+    if not (isinstance(a, list) and isinstance(p, list) and len(a) >= 2 and a[:-1] == p[:len(a) - 1]
+            and isinstance(a[-1], str) and not set(a[-1]) & set("*?[]")):
+        raise StatePolicyError(f"trust_from {p}: authored_by must name a field of the same record, not {a!r}")
 
 def _is_leaf(v): return not isinstance(v, (dict, list))
 
@@ -145,13 +169,26 @@ def _match(pattern, path):
 def _party(spec, path, value):
     return value if spec == "value" else path[int(spec.split(":")[1])]
 
+def identities(policy, flat):
+    """The user's own names in the environment: the identity fields' values and the literals."""
+    ids = {str(v).lower() for p, v in flat.items() if any(tuple(i) == p for i in policy.d.get("identity", []))}
+    return ids | {str(x).lower() for x in policy.d.get("identity_literals", [])}
+
 def trusted_parties(policy, pre_state):
-    """The user's own identity, and every party already in the environment."""
-    trusted = set()
-    for path, v in flatten(pre_state).items():
-        if any(tuple(i) == path for i in policy.d.get("identity", [])): trusted.add(str(v).lower())
+    """The user, and the parties of the trust_from fields. A field with
+    authored_by counts only in records the user wrote: the recipients of mail
+    the user sent, not of mail sent to the user."""
+    flat = flatten(pre_state)
+    ids = identities(policy, flat)
+    trusted = set(ids)
+    for path, v in flat.items():
         for t in policy.d.get("trust_from", []):
-            if _match(t["path"], path): trusted.add(str(_party(t["party"], path, v)).lower())
+            if not _match(t["path"], path): continue
+            a = t.get("authored_by")
+            if a is not None:
+                author = flat.get(path[:len(a) - 1] + (a[-1],))
+                if author is None or str(author).lower() not in ids: continue
+            trusted.add(str(_party(t["party"], path, v)).lower())
     return trusted
 
 def named_in(prompt, party):
@@ -242,7 +279,7 @@ class StateGate:
         self.ran, self.pre_env, self.post_env = [], None, None   # this task's calls that ran, and its states
 
     def begin(self, prompt, env):
-        """A task starts: what the user asked, and who is already known."""
+        """A task starts: what the user asked, and whom the user has brought in."""
         self.prompt = prompt
         self.trusted = trusted_parties(self.policy, env.model_dump(mode="json"))
         self.task_start, self.ran = len(self.log), []

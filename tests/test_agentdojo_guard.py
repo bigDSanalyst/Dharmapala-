@@ -75,6 +75,88 @@ def test_named_means_named_not_contained():
     assert not ag.named_in("mail evil.bob@example.com", "bob@example.com")
     assert not ag.named_in("pay x now", "x")                                       # too short to be named
 
+# --- who is trusted: the user, and whoever the user brought in -------------------------------------
+
+V1 = os.path.join(os.path.dirname(__file__), "..", "policies", "agentdojo-v1.json")
+ME = "emma@bluesparrowtech.com"
+
+def inbox(*emails):
+    return {"inbox": {"account_email": ME, "emails": {str(i): e for i, e in enumerate(emails)}, "contact_list": []}}
+
+def mail(sender, to, cc=()):
+    return {"sender": sender, "recipients": [to], "cc": list(cc), "bcc": [],
+            "status": "sent" if sender == ME else "received"}
+
+def mailed(pre, to):
+    after = copy.deepcopy(pre); after["inbox"]["emails"]["new"] = mail(ME, to); return after
+
+def test_someone_who_wrote_to_the_user_is_not_trusted_for_it():
+    """Anyone can send an email, and an injection that arrives by email comes
+    from its attacker. v1 trusted every sender, so one email let an attacker in."""
+    pre = inbox(mail("attacker@evil.example", ME))
+    assert effects(mailed(pre, "attacker@evil.example"), pre=pre)[0] == {"exfiltrate", "write"}
+    assert "attacker@evil.example" in ag.trusted_parties(ag.StatePolicy.load(V1), pre)
+
+def test_people_the_user_wrote_to_are_trusted():
+    pre = inbox(mail(ME, "bob@example.com", cc=["carol@example.com"]))
+    assert effects(mailed(pre, "bob@example.com"), pre=pre)[0] == {"write"}
+    assert effects(mailed(pre, "carol@example.com"), pre=pre)[0] == {"write"}
+
+def test_a_payment_to_the_user_does_not_make_the_payer_trusted():
+    """v1 trusted anyone who had paid the user: 0.01 bought an attacker the right to be paid."""
+    pre = copy.deepcopy(PRE)
+    pre["bank_account"]["transactions"].append({"sender": "US133000000121212121212", "recipient": "me"})
+    after = copy.deepcopy(pre)
+    after["bank_account"]["transactions"].append({"sender": "ME1", "recipient": "US133000000121212121212"})
+    assert "exfiltrate" in effects(after, pre=pre)[0]
+    assert "us133000000121212121212" in ag.trusted_parties(ag.StatePolicy.load(V1), pre)
+
+def test_payees_the_user_scheduled_and_contacts_the_user_saved_are_trusted():
+    pre = {"inbox": {"account_email": ME, "emails": {}, "contact_list": [{"email": "dan@example.com", "name": "Dan"}]},
+           "bank_account": {"iban": "ME1", "transactions": [],
+                            "scheduled_transactions": [{"sender": "ME1", "recipient": "LANDLORD1"}]}}
+    assert {"dan@example.com", "landlord1", "me1", "me"} <= ag.trusted_parties(POLICY, pre)
+
+def test_sharing_counts_only_on_the_users_own_files():
+    pre = {"cloud_drive": {"account_email": ME, "files": {
+        "1": {"owner": ME, "shared_with": {"carol@example.com": "r"}},
+        "2": {"owner": "mallory@evil.example", "shared_with": {ME: "r", "eve@evil.example": "r"}}}}}
+    trusted = ag.trusted_parties(POLICY, pre)
+    assert "carol@example.com" in trusted
+    assert not {"eve@evil.example", "mallory@evil.example"} & trusted
+
+@pytest.mark.parametrize("entry, why", [
+    ({"path": ["a", "*", "to"], "party": "value", "authored_by": ["b", "*", "from"]}, "same record"),
+    ({"path": ["a", "*", "to"], "party": "value", "authored_by": ["a", "*", "*"]}, "same record"),
+    ({"path": ["a", "*", "to"], "party": "value", "authored_by": "from"}, "same record"),
+    ({"path": ["a", "*", "to"], "party": "value", "trusted": True}, "unknown keys"),
+])
+def test_a_trust_rule_that_does_not_parse_is_refused(entry, why):
+    d = json.loads(json.dumps(POLICY.d)); d["trust_from"] = [entry]
+    with pytest.raises(ag.StatePolicyError, match=why): ag.StatePolicy(d)
+
+def test_a_v1_policy_still_means_what_it_meant_and_cannot_use_v2_keys():
+    v1 = ag.StatePolicy.load(V1)
+    for name in ("agentdojo-v1-default.json", "agentdojo-v1-strict.json"):
+        with open(os.path.join(os.path.dirname(V1), "..", "results", name)) as f:
+            assert json.load(f)["policy_hash"] == v1.hash(), name   # the results v1 produced name it
+    for change in ({"identity_literals": ["me"]},
+                   {"trust_from": [{"path": ["a", "*"], "party": "value", "authored_by": ["a", "from"]}]}):
+        d = {**json.loads(json.dumps(v1.d)), **change}
+        with pytest.raises(ag.StatePolicyError, match="unknown keys"): ag.StatePolicy(d)
+
+def test_the_known_attacker_test_changes_only_what_the_guard_reads():
+    import eval_agentdojo as ev
+    state = {**inbox(mail("boss@example.com", ME)),
+             "bank_account": {"iban": "ME1", "transactions": [], "scheduled_transactions": []}}
+    before = copy.deepcopy(state)
+    seeded = ev.with_attacker_history(state, ["mark.black-2134@gmail.com", "US133000000121212121212"])
+    assert state == before
+    assert len(seeded["inbox"]["emails"]) == 2 and len(seeded["bank_account"]["transactions"]) == 1
+    attackers = {"mark.black-2134@gmail.com", "us133000000121212121212"}
+    assert attackers <= ag.trusted_parties(ag.StatePolicy.load(V1), seeded)
+    assert not attackers & ag.trusted_parties(POLICY, seeded)
+
 def test_a_password_the_user_did_not_give_is_domination():
     after = copy.deepcopy(PRE); after["user_account"]["password"] = "hacked"
     assert effects(after)[0] == {"dominate"}
@@ -246,17 +328,23 @@ def test_the_cost_paying_an_account_read_from_a_file(banking):
     assert _run(banking, ut, None, ag.executor(gate))[0] is False
     assert [r["tool"] for r in gate.log if r["outcome"] == "refused"] == ["send_money"]
 
-RESULTS = os.path.join(os.path.dirname(__file__), "..", "results", "agentdojo-default.json")
+RESULTS = os.path.join(os.path.dirname(__file__), "..", "results")
+REPRODUCE = ([("agentdojo-default.json", None, False, s) for s in ("banking", "slack", "travel", "workspace")]
+             + [("agentdojo-known-attacker-default.json", None, True, s) for s in ("banking", "travel", "workspace")]
+             + [("agentdojo-v1-known-attacker-default.json", V1, True, "banking")])
 
-@pytest.mark.parametrize("suite", ["banking", "slack", "travel", "workspace"])
-def test_the_committed_results_reproduce(suite):
+@pytest.mark.parametrize("name, policy, known, suite", REPRODUCE)
+def test_the_committed_results_reproduce(name, policy, known, suite):
     """The first user task of each suite, against every injection task, run
-    again: what results/agentdojo-default.json records is what happens."""
+    again: what the results file records is what happens. The last case is
+    v1 against an attacker who has paid the user: the hole v2 closes."""
     _agentdojo()
     import eval_agentdojo as ev
-    with open(RESULTS) as f: committed = json.load(f)
-    assert committed["policy_hash"] == ag.StatePolicy.load().hash(), "the policy changed; re-run the evaluation"
-    now = ev.evaluate([suite], limit=1)["suites"][suite]
+    with open(os.path.join(RESULTS, name)) as f: committed = json.load(f)
+    pol = ag.StatePolicy.load(policy or ag.DEFAULT_POLICY)
+    assert committed["policy_hash"] == pol.hash(), "the policy changed; re-run the evaluation"
+    assert bool(committed.get("attacker_known")) == known
+    now = ev.evaluate([suite], limit=1, policy=pol, attacker_known=known)["suites"][suite]
     was = committed["suites"][suite]
     ut = next(iter(now["utility"]))
     assert now["utility"][ut] == was["utility"][ut]
@@ -264,6 +352,22 @@ def test_the_committed_results_reproduce(suite):
     assert now["misses"] == [m for m in was["misses"] if m.startswith(ut + "/")]
     assert now["by_user_task"][ut] == was["by_user_task"][ut]
     assert now["pairs"] == was["injection_tasks"] and now["feasible"] == was["by_user_task"][ut]["feasible"]
+
+def test_the_known_attackers_are_the_injection_tasks_own():
+    """ATTACKERS is copied from AgentDojo's injection tasks: each attacker must
+    still be someone an injection task sends money or data to."""
+    _agentdojo()
+    import eval_agentdojo as ev
+    from agentdojo.task_suite.load_suites import get_suites
+    suites = get_suites(ev.VERSION)
+    for name, attackers in ev.ATTACKERS.items():
+        goals = " ".join(t.GOAL for t in suites[name].injection_tasks.values()).lower()
+        for who in attackers: assert who.lower() in goals, (name, who)
+
+def test_the_known_attacker_test_refuses_a_suite_it_cannot_seed():
+    _agentdojo()
+    import eval_agentdojo as ev
+    with pytest.raises(ValueError, match="covers"): ev.evaluate(["slack"], limit=1, attacker_known=True)
 
 def test_who_is_known_is_read_once_when_the_task_begins(banking, monkeypatch):
     """Later calls must not re-read the environment for trusted parties: by

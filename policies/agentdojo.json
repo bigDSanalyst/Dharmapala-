@@ -1,9 +1,17 @@
 {
-  "format": "dharmapala-state-policy/v1",
-  "note": "What a change to an AgentDojo environment means. Written from the suites' tools and environment schema and the user tasks' prompts, not from the injection tasks. A party is trusted if it is the user's own identity, appears in a party field of the environment before the task began, or is named in the user's prompt.",
+  "format": "dharmapala-state-policy/v2",
+  "note": "What a change to an AgentDojo environment means. Written from the suites' tools and environment schema and the user tasks' prompts, not from the injection tasks. A party is trusted if it is the user, is named in the user's prompt, or was brought in by the user: someone the user has sent mail to, paid or scheduled a payment to, shared one of their own files with, saved as a contact, or met with (a meeting in the user's calendar). Someone who has only written to the user, or paid them, is not trusted by that: anyone can send an email or a payment. v1 (agentdojo-v1.json) trusted every party in the environment; see the README for what that let through.",
   "identity": [
     [
       "inbox",
+      "account_email"
+    ],
+    [
+      "cloud_drive",
+      "account_email"
+    ],
+    [
+      "calendar",
       "account_email"
     ],
     [
@@ -14,6 +22,9 @@
       "user",
       "email"
     ]
+  ],
+  "identity_literals": [
+    "me"
   ],
   "rules": [
     {
@@ -217,16 +228,13 @@
         "*",
         "recipient"
       ],
-      "party": "value"
-    },
-    {
-      "path": [
+      "party": "value",
+      "authored_by": [
         "bank_account",
         "transactions",
         "*",
         "sender"
-      ],
-      "party": "value"
+      ]
     },
     {
       "path": [
@@ -235,16 +243,13 @@
         "*",
         "recipient"
       ],
-      "party": "value"
-    },
-    {
-      "path": [
-        "inbox",
-        "emails",
+      "party": "value",
+      "authored_by": [
+        "bank_account",
+        "scheduled_transactions",
         "*",
         "sender"
-      ],
-      "party": "value"
+      ]
     },
     {
       "path": [
@@ -254,7 +259,13 @@
         "recipients",
         "*"
       ],
-      "party": "value"
+      "party": "value",
+      "authored_by": [
+        "inbox",
+        "emails",
+        "*",
+        "sender"
+      ]
     },
     {
       "path": [
@@ -264,7 +275,29 @@
         "cc",
         "*"
       ],
-      "party": "value"
+      "party": "value",
+      "authored_by": [
+        "inbox",
+        "emails",
+        "*",
+        "sender"
+      ]
+    },
+    {
+      "path": [
+        "inbox",
+        "emails",
+        "*",
+        "bcc",
+        "*"
+      ],
+      "party": "value",
+      "authored_by": [
+        "inbox",
+        "emails",
+        "*",
+        "sender"
+      ]
     },
     {
       "path": [
@@ -283,7 +316,13 @@
         "shared_with",
         "*"
       ],
-      "party": "seg:-1"
+      "party": "seg:-1",
+      "authored_by": [
+        "cloud_drive",
+        "files",
+        "*",
+        "owner"
+      ]
     },
     {
       "path": [

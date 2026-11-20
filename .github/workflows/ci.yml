@@ -20,6 +20,10 @@ jobs:
           echo "${LEAN_SHA256}  lean.tar.zst" | sha256sum -c -
           mkdir -p "$HOME/lean" && tar --zstd -xf lean.tar.zst -C "$HOME/lean" && rm lean.tar.zst
           echo "$HOME/lean/lean-${v}-linux/bin" >> "$GITHUB_PATH"
+      # The bounded-debt proofs (lean/BoundedDebt.lean) use core Lean only, no
+      # Mathlib, so one `lean` call checks every theorem in the file.
+      - name: BoundedDebt proofs
+        run: lean lean/BoundedDebt.lean
       - run: pip install -r requirements.txt pytest
       # The jail needs unprivileged user namespaces. Ubuntu 24.04 restricts them
       # through AppArmor, and bwrap then fails with "loopback: Failed RTM_NEWADDR:

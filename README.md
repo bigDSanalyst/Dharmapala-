@@ -22,7 +22,7 @@ and exits 1: a layer that did not run is not a layer that passed.
 | Lean critic | `lean` on PATH, version in `lean/lean-toolchain` | the critic falls back to a Python check |
 | Coq certificates | `coqc` (`apt install coq`) | attestations are signed as `coqc-unavailable` |
 | ML-DSA-65 signatures | `pip install dilithium-py` | signers fall back to HMAC, which anyone able to verify can forge |
-| Jail (real execution, traced) | `bwrap` and `strace` (`apt install bubblewrap strace`) | shell commands are recorded and never run |
+| Jail (real execution, traced) | `bwrap` and `strace` (`apt install bubblewrap strace`), on a Linux kernel with Landlock (5.13 or later) | shell commands are recorded and never run |
 
 CI installs all four, so a green CI run means all four ran.
 
@@ -37,7 +37,8 @@ call it proposes goes through the gate, in order:
 1. The critic dry-runs it, and rehearses a shell command in the jail against a
    copy of the workdir. A call that would break the Vow does not run, and
    Claude is told which effect was forbidden.
-2. The call runs for real. Shell commands run in the jail, traced. File tools
+2. The call runs for real. Shell commands run in the jail, traced, where they
+   can read only the system directories and write only the workdir. File tools
    stay inside the workdir unless the Vow says otherwise. `http_get` never
    reaches the network.
 3. The guard judges what actually ran. The co-signer checks it against the run
@@ -345,10 +346,12 @@ right. The code and results are kept on the branch `claude/unified-math-framewor
 
     python3 containment_mutants.py
 
-This breaks the jail one bubblewrap flag at a time and checks that a
-containment probe catches each break as an escape. It exits 0 only when
-every break is caught, and it names each flag no probe here can observe, with
-the reason. CI runs it as an unprivileged user and as root.
+This breaks the jail one bubblewrap flag, or one part of `confine.py`, at a
+time and checks that a containment probe catches each break as an escape. The
+two layers are tested on their own: bubblewrap's flags are broken with
+`confine.py` switched off, so Landlock cannot hide a break in them. It exits 0
+only when every break is caught, and it names each flag no probe here can
+observe, with the reason. CI runs it as an unprivileged user and as root.
 
 ## Verifying a ledger someone gave you
 

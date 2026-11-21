@@ -4,8 +4,8 @@ Each probe checks one containment property against something the test owns:
 a sibling directory it made, a sentinel process it started, a socket it is
 listening on, an environment variable it set. So the probes can run against a
 deliberately broken jail (containment_mutants.py does exactly that, one
-bubblewrap flag at a time) without anything real being written, killed or
-reached. A probe that sees the jail fail says ESCAPE:, which is how the
+bubblewrap flag or one part of confine.py at a time) without anything real
+being written, read, killed or reached. A probe that sees the jail fail says ESCAPE:, which is how the
 mutation runner tells a probe that caught a break from a jail that merely
 failed to start."""
 import os, pathlib, shutil, socket, subprocess, sys, tempfile, time, uuid
@@ -121,3 +121,51 @@ def test_nothing_outlives_a_stopped_run(work):
         for pid in _alive(f"sleep\x00{marker}"):
             try: os.kill(pid, 9)
             except OSError: pass
+
+def _outside_tmp():
+    """A directory of the test's own outside /tmp (the jail has its own /tmp)."""
+    home = pathlib.Path.home()
+    assert not str(home.resolve()).startswith("/tmp"), "the probe needs a directory outside /tmp"
+    return pathlib.Path(tempfile.mkdtemp(prefix=".dharma-containment-", dir=home))
+
+def test_only_the_system_directories_are_readable(work):
+    """A file only the test user can read, in its home, as credentials are.
+    The read-only root shows it to the jail; only confine.py's Landlock ruleset
+    keeps the command from reading it."""
+    outside = _outside_tmp()
+    try:
+        secret = outside / "credentials"
+        secret.write_text("dharma-containment-dummy\n"); secret.chmod(0o600)
+        run(f"cat {secret} > seen; echo ran >> seen", work)
+        seen = (work / "seen").read_text()
+        assert "ran" in seen, "the command did not run"
+        assert "dharma-containment-dummy" not in seen, "ESCAPE: read a file outside the system directories"
+    finally: shutil.rmtree(outside, ignore_errors=True)
+
+UNTRACED = """import ctypes, errno, platform
+L = ctypes.CDLL(None, use_errno=True); L.syscall.restype = ctypes.c_long
+openat2, execveat = {"x86_64": (437, 322), "aarch64": (437, 281)}[platform.machine()]
+class How(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint64), ("mode", ctypes.c_uint64), ("resolve", ctypes.c_uint64)]
+def call(nr, *args):
+    r = L.syscall(nr, *args)
+    return "ok" if r >= 0 else errno.errorcode.get(ctypes.get_errno(), "?")
+seen = {"openat2": call(openat2, -100, b"target", ctypes.byref(How()), 24),
+        "execveat": call(execveat, -100, b"./no-such-program", None, None, 0),
+        "io_uring_setup": call(425, 1, ctypes.byref((ctypes.c_char * 120)()))}
+open("calls", "w").write("\\n".join(f"{k} {v}" for k, v in seen.items()))
+"""
+
+def test_calls_the_trace_cannot_see_are_refused(work):
+    """Calls that open or execute a file without a call strace traces. Each
+    must be refused before it reaches the kernel (ENOSYS, from confine.py's
+    filter), so a program falls back to a call the trace shows. openat2 is
+    aimed at a file in the workdir, which Landlock allows, so only the filter
+    can stop it; anything other than ENOSYS means the call reached the kernel."""
+    (work / "target").write_text("x")
+    (work / "probe.py").write_text(UNTRACED)
+    run("python3 probe.py", work)
+    calls = dict(l.split(" ", 1) for l in (work / "calls").read_text().splitlines())
+    assert set(calls) == {"openat2", "execveat", "io_uring_setup"}, "the probe did not run"
+    reached = {k: v for k, v in calls.items() if v != "ENOSYS"}
+    assert not reached, f"ESCAPE: calls the trace cannot see reached the kernel: {reached}"

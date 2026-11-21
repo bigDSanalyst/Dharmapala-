@@ -20,14 +20,27 @@ def only(monkeypatch, *mutants):
 
 def test_a_jail_that_does_not_start_is_not_a_catch(monkeypatch):
     ok, baseline, [r] = only(monkeypatch, ("no jail", "bubblewrap is replaced by a program that fails",
-                                           '["bwrap", ', '["false", '))
+                                           "jail.py", '["bwrap", ', '["false", '))
     assert baseline["passed"] and not ok
     assert r["status"] == "SURVIVED" and not r["caught_by"] and r["other_failures"]
 
 def test_a_real_break_is_a_catch(monkeypatch):
-    ok, _, [r] = only(monkeypatch, ("environment kept", "", '"--clearenv", ', ''))
+    ok, _, [r] = only(monkeypatch, ("environment kept", "", "jail.py", '"--clearenv", ', ''))
     assert ok and r["status"] == "caught" and r["caught_by"] == ["test_the_host_environment_is_not_inherited"]
 
 def test_a_mutant_that_no_longer_applies_is_not_passed_over(monkeypatch):
-    ok, _, [r] = only(monkeypatch, ("gone", "", '"--no-such-flag",', ''))
+    ok, _, [r] = only(monkeypatch, ("gone", "", "jail.py", '"--no-such-flag",', ''))
     assert not ok and r["status"] == "stale"
+
+def test_a_bubblewrap_break_is_tested_without_confine(monkeypatch):
+    """With confine.py on, Landlock stops the write a writable root would let
+    through, and the break would survive. Bubblewrap's flags are therefore
+    broken with confine.py off, and the read-only root's own probe catches it."""
+    ok, baseline, [r] = only(monkeypatch, ("root writable", "", "jail.py",
+                                           '"--ro-bind", "/", "/"', '"--bind", "/", "/"'))
+    assert ok and r["caught_by"] == ["test_the_host_filesystem_is_read_only"]
+    assert set(baseline["without_confine"]["escapes"]) == cm.CONFINE_PROBES
+
+def test_a_confine_break_is_a_catch(monkeypatch):
+    ok, _, [r] = only(monkeypatch, ("seccomp off", "", "confine.py", "    _seccomp(libc)\n", ""))
+    assert ok and r["status"] == "caught" and r["caught_by"] == ["test_calls_the_trace_cannot_see_are_refused"]

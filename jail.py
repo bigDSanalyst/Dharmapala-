@@ -9,12 +9,18 @@
 #                workdir, a fresh /tmp, no network, its own process and IPC
 #                namespaces (kill -9 -1 reaches nothing outside), no new
 #                privileges, killed with its parent
+#                confine.py, inside it: Landlock lets the command read only
+#                the system directories and write only the workdir, whatever
+#                call it opens a file with; seccomp refuses the calls that
+#                open or execute a file out of strace's sight (openat2,
+#                execveat, io_uring, file handles), so the trace is complete
 #   detection    strace -f: every exec, open, connect, unlink, rename and
 #                kill, including the ones the jail refused. An attempt is
 #                an effect: trying to write /etc is the harm the Vow names,
 #                whether or not the jail let it land.
 #
-# Fail closed: without bwrap and strace nothing runs. Never "run it unjailed".
+# Fail closed: without bwrap and strace nothing runs, and neither does a
+# command confine.py could not confine. Never "run it unjailed".
 import os, re, shutil, subprocess, tempfile
 from dataclasses import dataclass, field
 
@@ -23,6 +29,7 @@ from observation import (FILE_READERS, NETWORK_COMMANDS, PACKAGE_COMMANDS,
                          DESTRUCT_CMDS, DOMINATE_CMDS, _touch_host, _touch_path, inside, normalise)
 
 TIMEOUT = 30.0
+CONFINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "confine.py")
 SYSCALLS = ("execve,openat,open,creat,connect,unlinkat,unlink,renameat,renameat2,rename,kill,"
             "clone,clone3,fork,vfork")
 # Reads every dynamically linked program makes before it does anything. Not
@@ -82,7 +89,16 @@ def _bwrap(workdir, source=None):
             # variables (LD_LIBRARY_PATH on GitHub's runners) change what every
             # program opens. Only these three go in.
             "--clearenv", "--setenv", "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "--setenv", "HOME", w, "--setenv", "LANG", "C.UTF-8"]
+            "--setenv", "HOME", w, "--setenv", "LANG", "C.UTF-8"] + _confine(w)
+
+def _confine(w):
+    # Run by the jail's own python3 (found on the PATH above), not the one
+    # running the guard: that one may live outside the system directories
+    # and need loader variables the jail does not pass in. The source goes in
+    # with -c rather than as a path, because this repository may itself be
+    # where the jail cannot see it (anywhere under /tmp, which is the jail's own).
+    with open(CONFINE) as f: source = f.read()
+    return ["python3", "-I", "-c", source, w, "--"]
 
 def run(cmd, workdir, timeout=None, _probe=False):
     """Run `cmd` with sh inside the jail, traced. Raises JailUnavailable
@@ -109,6 +125,8 @@ def run(cmd, workdir, timeout=None, _probe=False):
     finally: shutil.rmtree(tdir, ignore_errors=True)
     events = parse(per_pid, cmd)
     if not _probe and events is None:
+        refused = [l for l in err.splitlines() if l.startswith("dharma-jail:")]
+        if refused: raise JailUnavailable(refused[-1])
         raise JailUnavailable("the trace never shows the command starting; not trusting an unobserved run")
     return Execution(rc, out, err, events or [], trace=per_pid, timed_out=to)
 

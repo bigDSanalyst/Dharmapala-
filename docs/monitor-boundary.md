@@ -21,7 +21,7 @@ The Phase 1 prototype (`jail_landlock.py`) is not included: `confine.py` replace
 | The model (the agent) | remote, behind the API | this host only through `Gate.run` |
 | `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process | everything the user can |
 | `CoSigner`, `TrajectoryCoSigner` | the same process | both ML-DSA-65 signing keys |
-| `file_read`, `file_write` | the same process, through `cw_vfs` (#28) | regular files beneath the workdir, opened with `openat2` from a pinned descriptor |
+| The monitor (P0): `file_read`, `file_write`, jail spawning, the session record | its own process (`monitor.py`, Phase 2 slice 2), undumpable | the workdir's pinned descriptor (`cw_vfs`, #28) and the `Monitor` key, which the gate never holds |
 | `shell` commands | bubblewrap jail with Landlock and seccomp (`confine.py`, #26, #27), traced by strace | the system directories and listed `/etc` entries, read-only; the workdir, read-write |
 
 At `676760e` the jail bound the whole host root read-only, and the file tools resolved paths in
@@ -207,6 +207,22 @@ the monitor's ML-DSA-65 key, and it:
 
 It stores each raw trace and puts the trace's hash in the chain, but never parses it.
 
+*As built (slice 2):* `monitor.py serve`, for the real workdir. Rehearsal and replay copies are still
+made in P1, and move into P0 with slice 3.
+- **Started by the gate, not the other way round.** This proposal had P0 create the socketpair and P1
+  inherit it. The gate starts P0 instead, so that a library caller or a test can use it without
+  forking itself.
+- **First thing it does:** P0 makes itself undumpable (`PR_SET_DUMPABLE` 0), so no process of the same
+  user, its parent included, can ptrace it or read its memory. It also asks to die with its parent.
+- **Peer check:** it refuses a peer whose `SO_PEERCRED` is not its parent.
+- **Key:** it generates its ML-DSA-65 key itself and sends only the public half. Without ML-DSA-65 it
+  refuses to start, since a shared-secret key would have to be shared with the gate. The monitor then
+  runs in the gate's process under the same HMAC fallback as the other signers.
+- **Shell:** P0 runs the jail (`jail.run_raw`) and returns the raw trace unread. The gate parses it
+  (`jail.parse`) and adds the events. A record's result hash leaves them out, because they are the
+  gate's reading, not the monitor's output. If the trace never shows the command starting, the gate
+  records no events, and the co-signer's own reading (`witness.events_for`) refuses the run.
+
 P0 never applies Landlock to itself while it is live. The kernel refuses `mount(2)` to a process under
 a Landlock ruleset that restricts the filesystem, so a Landlocked P0 could start no jail (verified, §5).
 
@@ -268,6 +284,22 @@ bwrap itself provides:
   P0 numbers and hashes every record; P1 never constructs one.
 - **Compatibility:** P1 keeps the `Sandbox` interface (a client wrapping the socket), so
   `critic_loop` and `guarded_agent` change little.
+
+*As built (slice 2):* `monitor.RemoteMonitor` and `RemoteSandbox`, with two differences from the above.
+- **Transport:** frames are length-prefixed on a `SOCK_STREAM` socketpair: a 4-byte big-endian length,
+  then one canonical JSON object. `SOCK_SEQPACKET` caps a message at the socket's send buffer, which
+  is 212992 bytes by default (verified: a 300 KB message fails with `EMSGSIZE`), and a jailed run's
+  raw trace can be longer. Requests are capped at 1 MiB; a larger length is refused before its payload
+  is read.
+- **Operations:** `file_read {path}`, `file_write {path, content}`, `shell {cmd}`, `http_get {url}` and
+  `checkpoint {}`.
+  - There is one space, the real workdir. `open_space`, `close_space` and the `space` argument come
+    with slice 3's rehearsal and replay spaces.
+  - `file_write` takes no `mode`.
+  - `checkpoint` answers with the run's session block (§5).
+- **Violations:** a request that is not exactly the next `seq` and a known operation with its
+  arguments, all strings, ends the monitor (exit 3). The gate then refuses every call: "the monitor
+  process is gone". Slice 4 makes that a recorded tripwire.
 
 ## 5. Records, checkpoints and binding
 
@@ -430,6 +462,8 @@ This needs a decision first (§8, item 1).
 
 **Phase 2: P0 and IPC.**
 - Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
+  *Done for the real workdir (slice 2):* the monitor process and its client. Snapshots for rehearsal
+  and replay move with slice 3.
 - Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
   *Done, in-process:* `monitor.py` (slice 1).
 - Apply Landlock to P1 so it cannot open the workdir.
@@ -471,3 +505,13 @@ This needs a decision first (§8, item 1).
    IPC refusals are P0's own. The options:
    - accept this, since P1 compromise is Phase 3's concern;
    - give the tripwire decision a parser of its own outside P1, for example in P2.
+
+   *Decided:*
+   - **P0 latches only on what an honest P1 cannot produce:** malformed IPC frames, unknown operations
+     or arguments at the IPC layer, and P0's own invariant failures.
+   - **Everything else goes to the quarantine stream, and the session stays live:** `cw_vfs` refusals
+     (a missing file, a `../` path, an absolute path outside the workdir all come back as these),
+     BoundedDebt budget refusals, and refused syscalls.
+   - **P1 reports trace and Vow tripwires.** A false one ends the session, which fails closed. A
+     silent one is caught after the fact by P2 re-reading P0's signed raw traces (Phase 3): P2 catches
+     the lie, but does not prevent the action.

@@ -165,8 +165,11 @@ class Gate:
         finally: self.co_signer.release(snap)
 
     def _run(self, call_id, name, args, plan, predicted, snap):
-        observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok, policy=self.policy,
-                                  monitor=self.monitor)
+        try:
+            observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok, policy=self.policy,
+                                      monitor=self.monitor)
+        except monitor_mod.MonitorGone as e:
+            return self._out(call_id, name, args, "refused", f"{e}; nothing more runs in this session")
         # 3. The guard judges what ran; the co-signer checks the guard.
         action = Action(id=call_id, verb=name, domain="action")
         action._observed_effects = observed
@@ -244,13 +247,17 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     vow = parse_vow(vow_source)
     ledger = Ledger(sangha_id="agent", path=ledger_path)
     guard = Guard("Guard", ledger)
-    s_co, s_tr, s_mon = default_signer("CoSigner"), default_signer("Trajectory"), default_signer("Monitor")
-    for s in (s_co, s_tr, s_mon): ledger.register_verifier(verifier_for(s))
+    s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
+    for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
     # The monitor states the session's workdir and root once, signed, and
-    # chains every real call; the co-signer holds its key and checks each run
-    # against it (monitor.py, docs/monitor-boundary.md section 5).
-    mon = monitor_mod.Monitor(s_mon, workdir, policy_hash=policy.hash(), vow_hash=vow.hash())
-    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=verifier_for(s_mon), workdir=workdir)
+    # chains every real call; the co-signer holds its public key and checks
+    # each run against it (monitor.py, docs/monitor-boundary.md section 5). It
+    # runs as its own process, holding a key this one never sees, whenever
+    # ML-DSA-65 is installed; without it a key would have to be shared, so it
+    # runs here, under the same HMAC fallback as the other signers.
+    mon = monitor_mod.start(workdir, policy_hash=policy.hash(), vow_hash=vow.hash())
+    ledger.register_verifier(mon.verifier)
+    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=mon.verifier, workdir=workdir)
     gate = Gate(vow, workdir, guard, co, TrajectoryCoSigner(s_tr), policy=policy,
                 runs_log=runs.RunLog(runs_path), monitor=mon)
     return gate, ledger

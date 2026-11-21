@@ -49,7 +49,8 @@ def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir
     for tool, kwargs in plan:
         check_call(tool, kwargs)
     if monitor is not None: monitor.begin_run()
-    real = Sandbox(workdir, jail=jail, logical_workdir=logical_workdir, monitor=monitor)
+    real = (monitor.sandbox(workdir, jail=jail, logical_workdir=logical_workdir) if monitor is not None
+            else Sandbox(workdir, jail=jail, logical_workdir=logical_workdir))
     try:
         for tool, kwargs in plan:
             dispatch(real, tool, kwargs)

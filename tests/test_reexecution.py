@@ -156,12 +156,49 @@ def test_a_run_without_jailed_calls_is_not_replayed(tmp_path, binary):
 # --- the guarded agent ---------------------------------------------------------------------------
 
 def test_the_guarded_agent_withholds_a_run_whose_trace_was_forged(tmp_path, monkeypatch):
+    """The jail that runs the call lies. That jail is the monitor's, in its own
+    process, out of a monkeypatch's reach; so the monitor here runs in this
+    process (as it does without ML-DSA-65), standing in for a monitor whose
+    jail forges. It records the forged trace faithfully, the record checks,
+    and only the co-signer's replay shows the open."""
     import guarded_agent as ga
+    import monitor as monitor_mod
     from tests.test_guarded_agent import Scripted, call, results, text, turn
+    monkeypatch.setattr(monitor_mod, "start", lambda workdir, policy_hash="", vow_hash="": monitor_mod.Monitor(
+        default_signer("Monitor"), workdir, policy_hash=policy_hash, vow_hash=vow_hash))
     gate, ledger = ga.setup(tmp_path / "work")
     forging(monkeypatch)
     client = Scripted(turn(call(1, "shell", cmd=SHADOW_SCRIPT)), turn(text("done"), stop="end_turn"))
     ga.GuardedAgent(client, gate).run("task")
     [r] = results(client, 1)
     assert r["is_error"] and "withheld" in r["content"] and "re-executed" in r["content"]
+    assert not ledger.records and ledger.audits
+
+def test_the_guarded_agent_withholds_a_run_whose_trace_the_gate_forged(tmp_path, monkeypatch):
+    """The monitor's trace is honest, and the gate's process drops the open
+    from it before building the run record (and from its own rehearsal, which
+    still runs in the gate's process, or the critic would refuse first). The
+    monitor recorded the trace it returned, so the run no longer matches its
+    record, and the co-signer refuses before it replays anything."""
+    import guarded_agent as ga
+    import monitor as monitor_mod
+    from tests.test_guarded_agent import Scripted, call, results, text, turn
+    gate, ledger = ga.setup(tmp_path / "work")
+    assert isinstance(gate.monitor, monitor_mod.RemoteMonitor)
+    real = monitor_mod.RemoteMonitor.call
+    def call_and_forge(self, op, **args):
+        resp = real(self, op, **args)
+        if op == "shell":
+            t = resp["result"]["trace"]
+            resp["result"]["trace"] = {pid: "\n".join(l for l in text.splitlines()
+                                                       if "/etc/shadow" not in l or '"sh", "-c"' in l)
+                                       for pid, text in t.items()}
+        return resp
+    monkeypatch.setattr(monitor_mod.RemoteMonitor, "call", call_and_forge)
+    forging(monkeypatch)                                  # the rehearsal, in this process
+    client = Scripted(turn(call(1, "shell", cmd=SHADOW_SCRIPT)), turn(text("done"), stop="end_turn"))
+    ga.GuardedAgent(client, gate).run("task")
+    [r] = results(client, 1)
+    assert r["is_error"] and "withheld" in r["content"]
+    assert "not the call the monitor recorded" in r["content"] and "re-executed" not in r["content"]
     assert not ledger.records and ledger.audits

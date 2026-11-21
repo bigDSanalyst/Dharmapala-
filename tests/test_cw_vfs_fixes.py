@@ -175,3 +175,20 @@ def test_a_file_that_is_not_text_is_still_an_error(tmp_path):
         assert not sb.file_read("b.bin")["ok"]
     finally:
         sb.close()
+
+
+def test_file_read_does_not_reach_a_credentials_file_outside_the_workdir(tmp_path):
+    """The file tools used to follow an absolute path anywhere, so the model
+    could be handed ~/.aws/credentials. Absolute, climbing with .., or through
+    a symlink inside the workdir: each is refused."""
+    home = tmp_path / "home"; (home / ".aws").mkdir(parents=True)
+    (home / ".aws" / "credentials").write_text("DHARMA-DUMMY-CREDENTIALS\n")
+    w = tmp_path / "w"; w.mkdir(); (w / "link").symlink_to(home / ".aws")
+    target = str(home / ".aws" / "credentials")
+    sb = Sandbox(w)
+    try:
+        for path in (target, "../" * 12 + target.lstrip("/"), "link/credentials"):
+            r = sb.file_read(path)
+            assert not r["ok"] and "DHARMA-DUMMY" not in str(r), path
+    finally:
+        sb.close()

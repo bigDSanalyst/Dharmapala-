@@ -77,3 +77,29 @@ class Sandbox:
         else:
             r = {"ok": True, "cmd": cmd, "blocked": True}
         self._record("shell", kwargs, r); return r
+
+
+# How a plan's calls reach a Sandbox: a fixed table of the four tools and
+# exactly their arguments, never getattr on a name the plan supplies. That
+# would run any attribute: a plan naming __init__ re-roots the sandbox
+# (docs/monitor-boundary.md, F4). guarded_agent.ARGS is the same table, as
+# the model sees it (tests/test_dispatch.py keeps the two in step).
+TOOL_ARGS = {"file_read": ("path",), "file_write": ("path", "content"),
+             "shell": ("cmd",), "http_get": ("url",)}
+_DISPATCH = {"file_read": Sandbox.file_read, "file_write": Sandbox.file_write,
+             "shell": Sandbox.shell, "http_get": Sandbox.http_get}
+
+class UnknownCall(ValueError):
+    """A plan step that is not a call to one of the four tools with exactly its arguments."""
+
+def check_call(tool, kwargs):
+    """Refuse (UnknownCall) anything but one of the four tools with exactly
+    its own arguments, every one a string."""
+    if not isinstance(tool, str) or tool not in _DISPATCH or not isinstance(kwargs, dict) \
+            or set(kwargs) != set(TOOL_ARGS[tool]) or not all(isinstance(v, str) for v in kwargs.values()):
+        raise UnknownCall(f"not a call to a known tool: {tool!r}")
+
+def dispatch(sandbox, tool, kwargs):
+    """Run one call on `sandbox` through the table."""
+    check_call(tool, kwargs)
+    return _DISPATCH[tool](sandbox, **kwargs)

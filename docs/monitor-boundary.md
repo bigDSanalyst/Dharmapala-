@@ -41,8 +41,9 @@ inside the host that needed work, one is closed for containment and one is open:
 1. **Jail → observation.** The guard judges what strace shows, and strace is told to show 15 syscalls.
    Since #26, the calls that open or execute a file without passing through one strace shows
    (`openat2`, `execveat`, `io_uring_*`, file handles) fail, and Landlock bounds what any call can
-   reach (F1). A refused attempt still leaves nothing in the trace, so a run that tried one is
-   judged `lawful`. Recording those attempts is part of Phase 2 (§5, "Quarantine stream").
+   reach (F1). The refused calls are traced too, and each attempt is recorded as a `refused` event.
+   It is telemetry, not an effect, so a run that tried one is still judged `lawful` (§5,
+   "Quarantine stream").
 2. **Parsing → keys.** Open (F2): the process that parses attacker-influenced bytes (traces, file
    contents, model output) also holds both signing keys.
 
@@ -84,7 +85,8 @@ whatever syscall makes the call. seccomp makes `openat2`, `execveat`, `io_uring_
 `open_by_handle_at` and `name_to_handle_at` fail with ENOSYS. At `bb926a5`, `repro_openat2.py`
 gives: control refused; the openat2 run `lawful`, and the model receives no key material (verified).
 The run is still judged `lawful` because the refused call is not in the trace: containment holds,
-but the attempt goes unseen.
+but the attempt goes unseen. Since then, the attempt is recorded as a `refused` event (§5), and the
+run is still judged `lawful`.
 
 ### F2. Signing keys share an address space with the parsers
 
@@ -325,15 +327,18 @@ P0 records refused tool calls and tripwire events to a separate, append-only qua
     entries per session), so spam cannot exhaust disk or pollute the honest session's budget.
 - **Telemetry-only syscall denials:**
   - The blocked syscalls (`openat2`, `execveat`, `io_uring_setup`, `socket`, and the rest of
-    `confine.py`'s deny list) are added to `jail.SYSCALLS`, so they appear in the raw strace blob.
-    Today they are not traced.
+    `confine.py`'s deny list) are in `jail.SYSCALLS`, so they appear in the raw strace blob.
+  - Both parsers record each one that failed as a `refused` event: `(call, what it named, errno)`.
+    `jail.effects_of` gives it no effect.
   - `--seccomp-bpf` must stay off. With it, the filter's errno outranks strace's trace stop, and the
-    refused calls vanish from the trace (verified at `bb926a5`). A test must pin it.
+    refused calls vanish from the trace (verified at `bb926a5`). `tests/test_refused_calls.py` pins
+    it.
   - glibc's name-service lookups make refused `socket(AF_UNIX)` calls in ordinary commands
-    (`id -un; ls -l` made several). bwrap's own setup sockets appear in the trace before the filter
-    is installed.
+    (`id -un; ls -l` makes six). bwrap's own setup sockets appear in the raw trace before the
+    filter is installed. The parsers skip them, as they skip everything before the command starts.
   - So these events are recorded strictly as forensic telemetry, never as refusal or tripwire
-    triggers, and `jail.parse` and `witness.py` must treat them the same way.
+    triggers. `jail.parse` and `witness.py` agree on them: `tests/test_witness.py` and
+    `tests/test_refused_calls.py` check it.
 - **Irreversible live → captured latch (strictly terminal):** on a tripwire event, P0:
   1. closes `real_jail._root_fd` and deletes the `real` space handle;
   2. applies `landlock_restrict_self`, restricting P0 to the quarantine/log directory only;
@@ -396,6 +401,7 @@ This needs a decision first (§8, item 1).
 - Replace every `getattr` dispatch with a table (F4).
 - Add the quarantine stream and the terminal capture latch (§5).
 - Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
+  *Done:* `tests/test_refused_calls.py`.
 - Exit:
   - a test shows P1 cannot open the workdir;
   - every operation appears in a verified chain, and a tampered record fails `verify.py`;

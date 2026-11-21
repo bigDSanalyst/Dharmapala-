@@ -23,6 +23,12 @@
 #                Unix socket file is judged as a write to that path. An attempt is
 #                an effect: trying to write /etc is the harm the Vow names,
 #                whether or not the jail let it land.
+#                The calls confine.py's filter refuses are traced too, so an
+#                attempt at one is in the record as a "refused" event. That is
+#                telemetry, not an effect (docs/monitor-boundary.md, section 5):
+#                glibc's name lookups try socket(AF_UNIX) in ordinary commands.
+#                strace must not use --seccomp-bpf, which would hide them
+#                (tests/test_refused_calls.py).
 #
 # Fail closed: without bwrap and strace nothing runs, and neither does a
 # command confine.py could not confine. Never "run it unjailed".
@@ -35,8 +41,14 @@ from observation import (FILE_READERS, NETWORK_COMMANDS, PACKAGE_COMMANDS,
 
 TIMEOUT = 30.0
 CONFINE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "confine.py")
+# The calls confine.py's filter refuses (its SYSCALL_TABLES), traced so that an
+# attempt at one is recorded; tests/test_refused_calls.py keeps the two in step.
+# The value is where the call's path argument is, or None if it has none.
+REFUSABLE = {"openat2": 1, "execveat": 1, "name_to_handle_at": 1, "open_by_handle_at": None,
+             "io_uring_setup": None, "io_uring_enter": None, "io_uring_register": None,
+             "socket": None}
 SYSCALLS = ("execve,openat,open,creat,connect,unlinkat,unlink,renameat,renameat2,rename,kill,"
-            "clone,clone3,fork,vfork")
+            "clone,clone3,fork,vfork," + ",".join(REFUSABLE))
 # Reads every dynamically linked program makes before it does anything. Not
 # the plan's doing, so not the plan's effect. Anything else outside the
 # workdir is read_outside_workdir, and every read is checked for sensitivity.
@@ -248,6 +260,16 @@ def parse(per_pid, cmd):
                                               _where(args, strs[1], "", False, 1)), ok))
             elif call == "kill":
                 events.append(("kill", args.split(",")[0].strip(), ok))
+            elif call in REFUSABLE:
+                # Recorded only when it failed: a socket the filter allows is
+                # no event (its connect is). (call, what it named, errno).
+                if ok or not ret.startswith("-"): continue
+                at = REFUSABLE[call]
+                if call == "socket": what = args.split(",")[0].strip()
+                elif at is not None and len(strs) > 0: what = _where(args, strs[0], "", False)
+                else: what = ""
+                err = re.match(r"\s*(E[A-Z0-9]+)", rest)
+                events.append(("refused", (call, what, err.group(1) if err else ""), False))
     return events
 
 def effects_of(events, workdir, policy=None):
@@ -296,4 +318,6 @@ def effects_of(events, workdir, policy=None):
             _touch_path(detail, workdir, effects, True, pol)
         elif kind == "kill":
             if detail.startswith("-"): effects.add("dominate")   # a whole process group, or everyone
+        elif kind == "refused":
+            continue    # telemetry: an attempt the filter stopped, recorded and never judged
     return effects

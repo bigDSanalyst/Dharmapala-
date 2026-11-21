@@ -19,13 +19,13 @@ The Phase 1 prototype (`jail_landlock.py`) is not included: `confine.py` replace
 | Component | Runs in | Can reach |
 |---|---|---|
 | The model (the agent) | remote, behind the API | this host only through `Gate.run` |
-| `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process: under Landlock from `guarded_agent`'s command line (`gate_confine.py`, Phase 2 slice 3b) | read and execute on the system, Python, the repository and the toolchains; read on the certificates TLS trusts and the model's stored login; its scratch; the ledger files. Not the workdir |
-| `CoSigner`, `TrajectoryCoSigner` | the same process | both ML-DSA-65 signing keys |
+| `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process: under Landlock from `guarded_agent`'s command line (`gate_confine.py`, Phase 2 slice 3b) | read and execute on the system, Python, the repository and the toolchains; read on the certificates TLS trusts and the model's stored login; its scratch; the ledger files. Not the workdir, and no signing key |
+| `CoSigner`, `TrajectoryCoSigner` (P2) | their own process (`cosigner.py`, Phase 3 slice 1), undumpable, started before the gate confines itself | both ML-DSA-65 signing keys, which the gate never holds; the co-signer's replay monitor (P0'), a child of P2 |
 | The monitor (P0): `file_read`, `file_write`, jail spawning, the session record | its own process (`monitor.py`, Phase 2 slice 2), undumpable | the workdir's pinned descriptor (`cw_vfs`, #28) and the `Monitor` key, which the gate never holds |
 | `shell` commands | bubblewrap jail with Landlock and seccomp (`confine.py`, #26, #27), traced by strace | the system directories and listed `/etc` entries, read-only; the workdir, read-write |
 
-At `676760e` the jail bound the whole host root read-only, and the file tools resolved paths in
-userspace.
+At `676760e` the jail bound the whole host root read-only, the file tools resolved paths in
+userspace, and the co-signers ran in the gate's process with both keys.
 
 What already holds, and should be kept as it is:
 
@@ -35,8 +35,8 @@ What already holds, and should be kept as it is:
   one and checks that a probe catches it, testing the bubblewrap layer and the `confine.py` layer
   each with the other switched off.
 
-So the model cannot reach `Sandbox`, the workdir descriptor or a key directly. Of the two boundaries
-inside the host that needed work, one is closed for containment and one is open:
+So the model cannot reach `Sandbox`, the workdir descriptor or a key directly. Two boundaries inside
+the host needed work:
 
 1. **Jail → observation.** The guard judges what strace shows, and strace is told to show 15 syscalls.
    Since #26, the calls that open or execute a file without passing through one strace shows
@@ -44,15 +44,17 @@ inside the host that needed work, one is closed for containment and one is open:
    reach (F1). The refused calls are traced too, and each attempt is recorded as a `refused` event.
    It is telemetry, not an effect, so a run that tried one is still judged `lawful` (§5,
    "Quarantine stream").
-2. **Parsing → keys.** Open (F2): the process that parses attacker-influenced bytes (traces, file
-   contents, model output) also holds both signing keys.
+2. **Parsing → keys.** Open at `676760e` (F2): the process that parses attacker-influenced bytes
+   (traces, file contents, model output) also held both signing keys. Since Phase 3, slice 1, the keys
+   are in a process of their own (P2), and the parsing process holds only their public keys. What
+   else keeps it out of P2's memory is slice 3's question (§7).
 
 ## 2. Findings
 
 | | Finding | Status |
 |---|---|---|
 | F1 | Reads through untraced syscalls never reach the guard | fixed in #26 |
-| F2 | Signing keys share an address space with the parsers | open: Phase 3 |
+| F2 | Signing keys share an address space with the parsers | fixed: `cosigner.py` (Phase 3, slice 1) |
 | F3 | Witnesses are not bound to the session's workdir | fixed in-process: `monitor.py` (Phase 2) |
 | F4 | `critic_loop.execute` dispatches by name without an allowlist | fixed: `tools.dispatch` (Phase 2) |
 | F5 | cw_vfs is not in `main`, and the versions in circulation have diverged | resolved in #28 and #29 |
@@ -94,6 +96,13 @@ run is still judged `lawful`.
 process that parses strace text (`witness.py`, `jail.parse`), file contents and model output. A logic or
 memory-safety bug in any of that code can make the co-signer sign anything, or leak a key for later use.
 The co-signer's independence is logical, not a separate process.
+
+**Fix (Phase 3, slice 1).** `cosigner.py`. With ML-DSA-65, both co-signers run in a process of their own
+(P2, §3), which generates their keys and gives the gate only the public ones. After a session with a
+write, a replayed shell call and a read, no signer object is left in the gate's heap, and every verifier
+its ledger holds is public (`tests/test_cosigner_process.py`; the same check finds the HMAC keys when
+ML-DSA-65 is missing). Without ML-DSA-65 the co-signers stay in the gate's process under HMAC keys,
+which doctor reports as DEGRADED, as it does every shared-secret signer.
 
 ### F3. Witnesses are not bound to the session's workdir
 
@@ -281,6 +290,32 @@ checkpoint. It verifies the chain, the signature and each witness's binding (§5
 its own parser, and replays through its own P0 instance. Its output is the ML-DSA-65 attestation, as
 today. The trajectory co-signer follows the same pattern.
 
+*As built (Phase 3, slice 1):* `cosigner.py serve`, on the pattern of the monitor's process.
+- **Started by the gate,** after its monitor and before it confines itself, so neither P2 nor its replay
+  monitor is under the gate's Landlock. It takes the workdir, the policy and the monitor's public key
+  from the gate then, before the gate has read anything the model sent. P2 generates both keys and
+  sends the public ones in its hello, and the gate's ledger registers those.
+- **The process:** undumpable and killed with its parent (`PR_SET_DUMPABLE` 0, `PR_SET_PDEATHSIG`). It
+  serves no peer but its parent (`SO_PEERCRED`), on a socketpair with length-prefixed canonical JSON
+  frames.
+- **Four operations,** with exactly their arguments and in sequence: `snapshot`, `release`, `cosign`
+  and `traj_cosign`. Anything else ends the process (exit 3).
+- **Values, not code.** P2 hashes its own binary and runs the engine it was built with: the gate's
+  binary path and engine never cross. It rebuilds each attestation, decision, action and trajectory
+  clause from its fields.
+- **Snapshots stay in P2.** The gate holds a handle. A handle P2 never gave names no snapshot, so the run
+  is not signed.
+- **Its replay monitor (P0') is its child,** and the gate holds no handle on it.
+- **The gate checks each attestation:** it must verify under the key from the hello, and be for the
+  proposal or action it was sent. A signed answer about another call is not taken.
+- **Once P2 has ended,** the gate runs nothing more in the session, as with a gone monitor. A call in
+  flight when it ends is not checked, and its output is withheld. The same holds once P2 fails to answer
+  in time or in turn, though it is still running, since its late answer would be read as the next
+  one's. Without its replay monitor, P2 takes no snapshot, so no shell call runs; file calls are still
+  checked.
+- **Not yet:** P2 keeps no state between calls (§5, slice 2 below). What keeps the gate's process out of
+  P2's memory, beyond `PR_SET_DUMPABLE`, is slice 3.
+
 **P3, Jail.** The bubblewrap jail as it is in `main` (#26, #27). `confine.py` runs inside bwrap, after
 the mounts and before the command, and applies:
 
@@ -383,7 +418,8 @@ and pinned like the other signers.
   checkpoint the session's previous run ended on, so a dropped run shows even when its output was
   withheld.
 - **Not yet:** the co-signer keeps no state between calls, so it cannot see a run hidden from it
-  between two it was shown. `verify.py` sees that; a stateful co-signer is Phase 3 (P2).
+  between two it was shown. `verify.py` sees that. A stateful co-signer is Phase 3, slice 2: since
+  slice 1, P2 lasts as long as the session, so it can keep that state.
 
 **Why not BLS12-381 aggregate signatures.** Dharmapala signs with ML-DSA-65, which is post-quantum.
 BLS is pairing-based and falls to a quantum attacker, so signing witnesses with it would downgrade the
@@ -579,10 +615,14 @@ This needs a decision first (§8, item 1).
   - after a tripwire, P0 can neither open the workdir nor start a jail (`tests/test_capture.py`).
 
 **Phase 3: keys out of P1.**
-- Move the co-signers into P2.
+- Move the co-signers into P2. *Done (slice 1):* `cosigner.py`.
+- A co-signer that remembers the session (slice 2): P2 refuses a run that does not start at the
+  checkpoint the last run it was shown ended on (§5).
 - `PR_SET_DUMPABLE=0` in P0 and P2; seccomp in P1 denying `ptrace` and `process_vm_*`; separate uids
-  where the platform allows.
-- Exit: P1 holds no key material.
+  where the platform allows (slice 3). *Done:* `PR_SET_DUMPABLE=0` in P0 (Phase 2, slice 2) and in P2
+  (slice 1).
+- Exit: P1 holds no key material. *Met (slice 1):*
+  `tests/test_cosigner_process.py::test_the_gate_holds_no_key_material`.
 
 **Phase 4: the BoundedDebt guard in P0**, after decision 1, with the absorbing `Mode` latch of §5.
 

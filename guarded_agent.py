@@ -314,6 +314,8 @@ def main(argv=None):
     gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path)
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
+    why_not = _confine(gate, ledger, workdir, args.ledger, runs_path, anthropic=args.backend == "anthropic")
+    if why_not is not None: return why_not
     if args.backend == "openai-compatible":
         backend = backends.OpenAICompatibleBackend(args.base_url, args.model, SYSTEM, TOOLS,
                                                    api_key=os.environ.get(args.api_key_env))
@@ -338,6 +340,37 @@ def main(argv=None):
         if "authentication method" not in str(e): raise
         print("no API credentials: set ANTHROPIC_API_KEY or run `ant auth login`", file=sys.stderr); return 1
     return _report(gate, ledger, pol, workdir, args, finished, text, first)
+
+def _confine(gate, ledger, workdir, ledger_path, runs_path, anthropic=False):
+    """Put this process under Landlock (gate_confine.py), now that its
+    monitors are running: from here on it cannot open the workdir, and every
+    call reaches it through a monitor. Returns None to go on, or the exit code.
+    The files it must still write are made first, as a valid empty ledger and
+    an empty run-records file, so no directory needs to stay writable.
+    anthropic: the model is called through the anthropic SDK, whose stored
+    login (`ant auth login`) the gate must keep reaching."""
+    import gate_confine
+    if not isinstance(gate.monitor, monitor_mod.RemoteMonitor):
+        print("warning: the monitor runs in this process (no ML-DSA-65), so this process cannot be confined",
+              file=sys.stderr)
+        return None
+    made = [p for p in (ledger_path, runs_path) if p]       # main() checked that neither was there
+    if ledger_path: ledger._persist()
+    if runs_path: open(runs_path, "a").close()
+    try:
+        gate_confine.confine_gate(workdir, files=made, anthropic=anthropic)
+    except gate_confine.Unavailable as e:
+        print(f"warning: the gate is not confined ({e}); it can open the workdir", file=sys.stderr)
+        return None
+    except gate_confine.Refused as e:
+        for f in made:                  # nothing ran: leave no record of a run
+            try: os.remove(f)
+            except OSError: pass
+        print(f"not starting: {e}", file=sys.stderr)
+        return 1
+    print("gate: confined (Landlock): this process cannot open the workdir; its monitors run every call",
+          file=sys.stderr)
+    return None
 
 def tool_calls_in_text(text):
     """Tool calls the model wrote into its answer as text instead of making

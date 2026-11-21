@@ -62,6 +62,16 @@ The default Vow forbids:
 `--vow FILE` replaces it. Credentials come from `ANTHROPIC_API_KEY` or
 `ant auth login`.
 
+Every call, and every rehearsal and replay, runs in a monitor process
+(`monitor.py`), which holds the workdir and the key that signs the run
+record. Once its monitors are running, the agent's own process, which reads
+everything the model and the tools send back, puts itself under Landlock
+(`gate_confine.py`): from then on it cannot open the workdir at all. It
+refuses to start with a workdir that overlaps a path it must keep reaching:
+this repository, the ledger, or the login `ant auth login` stored. Without
+Landlock, or without ML-DSA-65 (when the monitor runs in the agent's
+process), it runs unconfined and says so.
+
 ### What actually happened
 
 After the model's answer, the agent prints an account of every call, built

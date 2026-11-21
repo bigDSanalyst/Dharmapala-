@@ -19,7 +19,7 @@ The Phase 1 prototype (`jail_landlock.py`) is not included: `confine.py` replace
 | Component | Runs in | Can reach |
 |---|---|---|
 | The model (the agent) | remote, behind the API | this host only through `Gate.run` |
-| `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process | everything the user can |
+| `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process: under Landlock from `guarded_agent`'s command line (`gate_confine.py`, Phase 2 slice 3b) | read and execute on the system, Python, the repository and the toolchains; read on the certificates TLS trusts and the model's stored login; its scratch; the ledger files. Not the workdir |
 | `CoSigner`, `TrajectoryCoSigner` | the same process | both ML-DSA-65 signing keys |
 | The monitor (P0): `file_read`, `file_write`, jail spawning, the session record | its own process (`monitor.py`, Phase 2 slice 2), undumpable | the workdir's pinned descriptor (`cw_vfs`, #28) and the `Monitor` key, which the gate never holds |
 | `shell` commands | bubblewrap jail with Landlock and seccomp (`confine.py`, #26, #27), traced by strace | the system directories and listed `/etc` entries, read-only; the workdir, read-write |
@@ -240,6 +240,39 @@ observation and guard. It requests operations from P0 and holds no key. Landlock
 the workdir at all, so the only way to touch the workdir is through P0. It gets read access to the
 repository and toolchains, plus its own scratch directory. P1 starts no jail, so Landlock costs it
 nothing.
+
+*As built (slice 3b):* `gate_confine.py`, applied by `guarded_agent`'s command line once its monitors
+run. Landlock grants and cannot subtract, so the workdir is simply not among the grants.
+- **Read and execute:** the system directories, Python's installation and import path, the repository,
+  and the Lean and Coq toolchains.
+- **Read:** the certificates TLS trusts, each file or directory of them: where the environment names
+  them (`SSL_CERT_FILE` or `SSL_CERT_DIR`, a proxy's CA bundle, say) or Python finds them (OpenSSL's
+  defaults, certifi).
+- **The model's stored login:** with the anthropic backend and no key or token in the environment, the
+  SDK reads the login `ant auth login` stored (`~/.config/anthropic`, or `ANTHROPIC_CONFIG_DIR`), and
+  refreshing a token replaces its credentials file. So that directory stays readable, and in its
+  `credentials/` directory the gate may make, write, replace and remove files.
+  - A compromised gate could therefore read the stored refresh token, and replace or remove the
+    stored credentials. It cannot change the profile's config, so it cannot change where they are
+    sent. It already holds the token it calls the model with; keeping the model's credentials out of
+    P1 is not part of Phase 2.
+  - A profile whose `credentials_path` points elsewhere is not granted: the SDK fails to read it,
+    before any refresh, and the agent stops.
+  - A workload identity token named by `ANTHROPIC_IDENTITY_TOKEN_FILE` stays readable as the file it
+    was at startup. A token rotated by replacing the file, as Kubernetes does with a projected token,
+    is not readable once it has been replaced.
+- **Everything:** a private scratch directory, which becomes `TMPDIR`. A reaper, started before the
+  restriction and given only that path, removes it when the gate exits, however it exits.
+- **Read and write:** `/dev`'s device files, and the ledger and run-records files. These are made
+  first, as files, so no directory stays writable.
+- **Refused at startup:** a workdir inside any granted path, or holding one: the ledger, say, or the
+  stored login, whose directory a refresh writes in.
+- **Checked afterwards:** that the gate cannot open the workdir and holds no descriptor into it,
+  since Landlock does not revoke one already open. Either failing is a refusal.
+- **Unconfined, with a warning:** without Landlock, or without ML-DSA-65, when the monitor runs in the
+  gate's own process.
+- **Library callers** (`setup()`, the tests) are not confined. Landlock is for good, so
+  `tests/test_gate_landlock.py` confines processes of its own.
 
 **P2, Co-signer.** A separate process with its own key. Its input is an evidence bundle plus P0's signed
 checkpoint. It verifies the chain, the signature and each witness's binding (§5), re-derives effects with
@@ -485,13 +518,14 @@ This needs a decision first (§8, item 1).
   Landlock on it (slice 3b) needs.
 - Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
   *Done, in-process:* `monitor.py` (slice 1).
-- Apply Landlock to P1 so it cannot open the workdir.
+- Apply Landlock to P1 so it cannot open the workdir. *Done (slice 3b):* `gate_confine.py`.
 - Replace every `getattr` dispatch with a table (F4). *Done:* `tools.dispatch`.
 - Add the quarantine stream and the terminal capture latch (§5).
 - Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
   *Done:* `tests/test_refused_calls.py`.
 - Exit:
-  - a test shows P1 cannot open the workdir;
+  - a test shows P1 cannot open the workdir (`tests/test_gate_landlock.py`: not directly, through
+    `/proc/self/root`, or through a symlink of its own, while every call still runs);
   - every operation appears in a verified chain, and a tampered record fails `verify.py`;
   - a refused call appears in the quarantine stream;
   - after a tripwire, P0 can neither open the workdir nor start a jail.

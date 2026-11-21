@@ -6,6 +6,9 @@ action carries, and coqc must accept it. A co-signer reaches its own verdict,
 rebuilds that certificate and checks it itself, then signs the action, verdict
 and Vow it vouches for. Routine actions are judged but not certified. What the
 proofs rest on, and what they do not cover, is in `spec/FRAMEWORK.md`.
+Where the monitor's boundaries are, what was found in them, and the plan for
+separating the process that parses from the one that holds keys, is in
+`docs/monitor-boundary.md`.
 
 Runs end-to-end on Colab. Not audited. Not for production.
 

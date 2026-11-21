@@ -22,7 +22,10 @@
 #   checkpoint  {session, index, head}: the last record's index and hash
 #
 # Each is canonical JSON (sorted keys, no spaces), and each signature is over
-# that encoding. A run's evidence carries a "session" block: the signed header,
+# that encoding. Refusals go to a stream of their own, the quarantine stream
+# (Quarantine, below), never into this record.
+#
+# A run's evidence carries a "session" block: the signed header,
 # the checkpoint the run started from (None for the first), the run's records
 # and the checkpoint it ended on.
 import hashlib, json, os, secrets, stat, time
@@ -57,11 +60,105 @@ def root_of(workdir):
     finally:
         os.close(fd)
 
+# The quarantine stream (docs/monitor-boundary.md, section 5): what was refused
+# in a session, kept apart from its record, so that a refusal adds nothing to
+# what the session is held to. The monitor appends its own cw_vfs refusals
+# and the Vow and guard refusals the gate reports. It parses none of what it
+# keeps: it clips it, hashes it, chains it and signs a checkpoint over the
+# head at every append. The stream is written under quarantine/<session>/
+# when the monitor is given a directory, and is kept in memory otherwise.
+#
+#   record      {v, session, q_index, prev_q_hash, time, terminal_mode,
+#                trigger: {layer, reason, call_json, call_sha256, context_sha256,
+#                          record_index},
+#                artifacts, kernel_telemetry, pivot_chain}
+#   checkpoint  {session, q_index, head, terminal_mode, dropped}
+#
+# call_json is the refused call, kept up to Q_FIELD bytes; call_sha256 is over
+# all of it. record_index is the session record of a call the monitor ran and
+# refused (None for a refusal the gate reports). Past Q_MAX records, further
+# refusals are only counted (dropped). artifacts, kernel_telemetry and
+# pivot_chain are empty: nothing fills them yet.
+LAYERS = ("vow", "guard", "ipc", "cw_vfs", "jail")
+REPORTED = ("vow", "guard")          # what the gate may report; the rest are the monitor's own
+Q_MAX = 1000
+Q_FIELD = 4096
+Q_REASON = 128
+
+def _clip(text, n):
+    data = text.encode("utf-8")
+    return text if len(data) <= n else data[:n].decode("utf-8", "ignore")
+
+def _now(): return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _within(a, b):
+    return a == b or a.startswith(b.rstrip("/") + "/")
+
+class QuarantineError(ValueError):
+    """The quarantine directory cannot be the session's: it overlaps the workdir."""
+
+class Quarantine:
+    def __init__(self, session, sign, folder=None):
+        self.session, self._sign = session, sign
+        self.records, self.dropped, self.mode = [], 0, "live"
+        self.checkpoint = None
+        self.dir = None
+        if folder is not None:
+            self.dir = os.path.join(folder, session)
+            os.makedirs(self.dir, mode=0o700)        # a new session's; never one already there
+        self._seal(None)                 # an empty stream is signed too: a session with nothing refused
+    def head(self): return sha(self.records[-1]) if self.records else GENESIS
+    def _seal(self, rec):
+        cp = {"session": self.session, "q_index": len(self.records) - 1, "head": self.head(),
+              "terminal_mode": self.mode, "dropped": self.dropped}
+        self.checkpoint = dict(cp, signature=self._sign(cp))
+        if self.dir is not None: self._write(rec)
+    def add(self, layer, reason, call_json, context_sha256="", record_index=None):
+        """Append a refusal. (record, checkpoint); the record is None once
+        the stream is full, and the refusal is only counted."""
+        if layer not in LAYERS: raise ValueError(f"no layer {layer!r}")
+        rec = None
+        if len(self.records) >= Q_MAX:
+            self.dropped += 1
+        else:
+            rec = {"v": 1, "session": self.session, "q_index": len(self.records), "prev_q_hash": self.head(),
+                   "time": _now(), "terminal_mode": self.mode,
+                   "trigger": {"layer": layer, "reason": _clip(reason, Q_REASON),
+                               "call_json": _clip(call_json, Q_FIELD),
+                               "call_sha256": hashlib.sha256(call_json.encode("utf-8")).hexdigest(),
+                               "context_sha256": context_sha256, "record_index": record_index},
+                   "artifacts": [],
+                   "kernel_telemetry": {"trace_sha256": None, "trace_ref": None, "strace_seccomp_bpf": False},
+                   "pivot_chain": []}
+            self.records.append(rec)
+        self._seal(rec)
+        return rec, self.checkpoint
+    def _write(self, rec):
+        if rec is not None:
+            with open(os.path.join(self.dir, "records.jsonl"), "a") as f:
+                f.write(canon(rec) + "\n"); f.flush(); os.fsync(f.fileno())
+        tmp = os.path.join(self.dir, ".checkpoint.json")
+        with open(tmp, "w") as f:
+            f.write(canon(self.checkpoint)); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, os.path.join(self.dir, "checkpoint.json"))
+
+def load_quarantine(folder):
+    """(records, checkpoint) of the stream written under `folder` (a session's)."""
+    try:
+        with open(os.path.join(folder, "records.jsonl")) as f: records = [json.loads(l) for l in f if l.strip()]
+    except FileNotFoundError: records = []
+    with open(os.path.join(folder, "checkpoint.json")) as f: checkpoint = json.load(f)
+    return records, checkpoint
+
 class Monitor:
-    def __init__(self, signer, workdir, policy_hash="", vow_hash="", resolve_mask=None):
+    def __init__(self, signer, workdir, policy_hash="", vow_hash="", resolve_mask=None, quarantine=None):
         from signing import verifier_for
         import cw_vfs
         path, dev, ino = root_of(workdir)
+        if quarantine is not None:
+            q = os.path.realpath(quarantine)
+            if _within(q, path) or _within(path, q):
+                raise QuarantineError(f"the quarantine directory {q} overlaps the workdir {path}")
         self._signer = signer
         self.header = {"v": 1, "session": secrets.token_hex(16), "workdir": path, "root": [dev, ino],
                        "resolve_mask": cw_vfs.RESOLVE_STRICT_MASK if resolve_mask is None else resolve_mask,
@@ -74,6 +171,8 @@ class Monitor:
         self._checkpoint = None           # the last one signed
         self._run_from = 0                # the first record after it
         self.last_block = None            # the session block of the last run
+        self.quarantine = Quarantine(self.session, self._sign, quarantine)
+        self.quarantined = None           # (record, checkpoint) of the last call's refusal
     @property
     def verifier(self):
         from signing import verifier_for
@@ -91,7 +190,21 @@ class Monitor:
              "args_sha256": sha(kwargs), "result_sha256": result_sha(result),
              "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         self.records.append(r)
+        # A file call cw_vfs refused: a missing file, a ../ path and a path
+        # outside the workdir all come back as these (decision 5).
+        if op in ("file_read", "file_write") and isinstance(result, dict) and result.get("ok") is False:
+            self.quarantined = self.quarantine.add("cw_vfs", result.get("code") or "error",
+                                                   canon({"op": op, "args": kwargs}), record_index=r["index"])
         return r
+
+    def report_refusal(self, layer, reason, call, context=""):
+        """A refusal the gate decided (a Vow or guard refusal), into the stream."""
+        if layer not in REPORTED: raise ValueError(f"the gate does not report {layer!r} refusals")
+        return self.quarantine.add(layer, reason, call, context)
+    @property
+    def quarantine_records(self): return self.quarantine.records
+    @property
+    def quarantine_checkpoint(self): return self.quarantine.checkpoint
 
     def begin_run(self): pass      # a run is everything since the last checkpoint
 
@@ -118,6 +231,22 @@ def _checkpoint_ok(verifier, cp, session):
     if not isinstance(cp, dict): return False
     body = {k: cp.get(k) for k in ("session", "index", "head")}
     return body["session"] == session and _verify(verifier, body, cp.get("signature"))
+
+def check_quarantine(records, checkpoint, verifier, session):
+    """Raise SessionError unless `records` are a session's whole quarantine
+    stream: chained from the first, in order, and ending at `checkpoint`,
+    which `verifier` (the session's monitor) signed."""
+    prev = GENESIS
+    for i, r in enumerate(records):
+        if not isinstance(r, dict) or r.get("q_index") != i or r.get("prev_q_hash") != prev \
+                or r.get("session") != session or (r.get("trigger") or {}).get("layer") not in LAYERS:
+            raise SessionError(f"quarantine record {i} is not the next one of this session's")
+        prev = sha(r)
+    body = {k: checkpoint.get(k) for k in ("session", "q_index", "head", "terminal_mode", "dropped")} \
+        if isinstance(checkpoint, dict) else None
+    if body is None or body["session"] != session or body["q_index"] != len(records) - 1 \
+            or body["head"] != prev or not _verify(verifier, body, checkpoint.get("signature")):
+        raise SessionError("the quarantine checkpoint does not sign these records")
 
 def check_block(block, verifier, workdir=None, calls=None, policy_hash=None):
     """Raise SessionError unless `block` holds: the header and both checkpoints
@@ -211,7 +340,7 @@ PROTOCOL_EXIT = 3
 # real. An unknown space is a protocol violation, as an unknown op is.
 OPS = {"file_read": ("space", "path"), "file_write": ("space", "path", "content"), "shell": ("space", "cmd"),
        "http_get": ("space", "url"), "checkpoint": (), "open_space": ("source", "kind"),
-       "close_space": ("space",), "jail_status": ()}
+       "close_space": ("space",), "jail_status": (), "quarantine": ("layer", "reason", "call", "context")}
 # What a copy is for; its directory is named after it, as the gate's own copies were.
 KINDS = ("rehearsal", "snapshot", "replay")
 MAX_SPACES = 64
@@ -265,7 +394,14 @@ def _harden():
     if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 or libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "prctl")
 
-def serve(fd, workdir, policy_hash, vow_hash):
+def _reportable(args):
+    """A refusal the gate may report: a layer it decides, a short reason, and
+    a context hash or none."""
+    ctx = args["context"]
+    return args["layer"] in REPORTED and 0 < len(args["reason"]) <= Q_REASON and \
+        (ctx == "" or (len(ctx) == 64 and all(c in "0123456789abcdef" for c in ctx)))
+
+def serve(fd, workdir, policy_hash, vow_hash, quarantine=""):
     _harden()
     parent = os.getppid()
     sock = socket.socket(fileno=fd)
@@ -279,7 +415,9 @@ def serve(fd, workdir, policy_hash, vow_hash):
         send_frame(sock, {"v": 1, "refused": "no ML-DSA-65 (pip install dilithium-py)"}); return 1
     import shutil, tempfile
     from cw_vfs import ConfinementViolation, clone_confined_snapshot
-    mon = Monitor(signer, workdir, policy_hash=policy_hash, vow_hash=vow_hash)
+    try: mon = Monitor(signer, workdir, policy_hash=policy_hash, vow_hash=vow_hash, quarantine=quarantine or None)
+    except (ValueError, OSError) as e:
+        send_frame(sock, {"v": 1, "refused": str(e)}); return 1
     real = mon.header["workdir"]
     spaces = {"real": (None, Sandbox(real, jail=True, monitor=mon, parse_trace=False))}
     made = 0
@@ -297,6 +435,7 @@ def serve(fd, workdir, policy_hash, vow_hash):
                 if named is not None and named not in spaces: raise ValueError(f"no space {named!r}")
                 if op == "close_space" and named == "real": raise ValueError("the real space is not closed")
                 if op == "open_space" and args["kind"] not in KINDS: raise ValueError(f"no kind {args['kind']!r}")
+                if op == "quarantine" and not _reportable(args): raise ValueError("not a refusal the gate may report")
             except ValueError as e:
                 print(f"monitor: protocol violation: {e}", file=sys.stderr); return PROTOCOL_EXIT
             reply = {"v": 1, "seq": seq, "ok": True}
@@ -320,11 +459,17 @@ def serve(fd, workdir, policy_hash, vow_hash):
                         reply.update(space=None, error=f"the workdir cannot be copied: {e}")
             elif op == "close_space":
                 root, sb = spaces.pop(named); sb.close(); shutil.rmtree(root, ignore_errors=True)
+            elif op == "quarantine":
+                rec, cp = mon.report_refusal(args["layer"], args["reason"], args["call"], args["context"])
+                reply["quarantine"] = {"record": rec, "checkpoint": cp}
             else:
                 sb = spaces[named][1]
                 kwargs = {k: v for k, v in args.items() if k != "space"}
+                mon.quarantined = None
                 reply["result"] = dispatch(sb, op, kwargs)       # the fixed tool table (F4)
                 reply["record"] = mon.records[-1] if named == "real" else None
+                if mon.quarantined is not None:                  # a call it ran and refused
+                    reply["quarantine"] = dict(zip(("record", "checkpoint"), mon.quarantined))
                 sb.calls.clear()
             send_frame(sock, reply)
             seq += 1
@@ -334,7 +479,7 @@ def serve(fd, workdir, policy_hash, vow_hash):
             if root: shutil.rmtree(root, ignore_errors=True)
         sock.close()
 
-def start(workdir, policy_hash="", vow_hash=""):
+def start(workdir, policy_hash="", vow_hash="", quarantine=None):
     """The session's monitor: its own process when ML-DSA-65 is installed
     (RemoteMonitor), else a Monitor in this process under an HMAC key, which
     doctor reports as DEGRADED like every shared-secret signer."""
@@ -342,13 +487,14 @@ def start(workdir, policy_hash="", vow_hash=""):
         import dilithium_py.ml_dsa  # noqa: F401
     except ImportError:
         from signing import default_signer
-        return Monitor(default_signer("Monitor"), workdir, policy_hash=policy_hash, vow_hash=vow_hash)
-    return RemoteMonitor(workdir, policy_hash=policy_hash, vow_hash=vow_hash)
+        return Monitor(default_signer("Monitor"), workdir, policy_hash=policy_hash, vow_hash=vow_hash,
+                       quarantine=quarantine)
+    return RemoteMonitor(workdir, policy_hash=policy_hash, vow_hash=vow_hash, quarantine=quarantine)
 
 class RemoteMonitor:
     """The gate's handle on a monitor process for `workdir`. It holds the
     monitor's public key, never its signing key."""
-    def __init__(self, workdir, policy_hash="", vow_hash="", timeout=60):
+    def __init__(self, workdir, policy_hash="", vow_hash="", timeout=60, quarantine=None):
         from signing import PublicVerifier
         self.workdir = os.path.realpath(workdir)
         ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -356,11 +502,14 @@ class RemoteMonitor:
         try:
             self._proc = subprocess.Popen(
                 [sys.executable, "-E", "-s", os.path.join(here, "monitor.py"), "serve",
-                 str(theirs.fileno()), self.workdir, policy_hash, vow_hash],
+                 str(theirs.fileno()), self.workdir, policy_hash, vow_hash, quarantine or ""],
                 pass_fds=[theirs.fileno()], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, cwd=here)
         finally:
             theirs.close()
         self._sock, self._seq, self.last_block = ours, 0, None
+        # The monitor's quarantine stream as it answers: each record it made,
+        # and the checkpoint it signed over the last one.
+        self.quarantine_records, self.quarantine_checkpoint = [], None
         self._sock.settimeout(timeout)
         hello = self._recv()
         if "hello" not in hello:
@@ -389,7 +538,16 @@ class RemoteMonitor:
         if resp.get("seq") != self._seq or not resp.get("ok"):
             raise MonitorGone(f"the monitor answered out of turn: {str(resp)[:120]}")
         self._seq += 1
+        q = resp.get("quarantine")
+        if q is not None:
+            if q.get("record") is not None: self.quarantine_records.append(q["record"])
+            self.quarantine_checkpoint = q.get("checkpoint")
         return resp
+
+    def report_refusal(self, layer, reason, call, context=""):
+        """A refusal the gate decided (a Vow or guard refusal), into the monitor's stream."""
+        r = self.call("quarantine", layer=layer, reason=reason, call=call, context=context)["quarantine"]
+        return r["record"], r["checkpoint"]
 
     def begin_run(self): pass
     def end_run(self):
@@ -447,7 +605,8 @@ class RemoteSandbox:
     def close(self): pass
 
 if __name__ == "__main__":
-    if len(sys.argv) == 6 and sys.argv[1] == "serve":
-        sys.exit(serve(int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]))
-    print("usage: monitor.py serve FD WORKDIR POLICY_HASH VOW_HASH (started by RemoteMonitor)", file=sys.stderr)
+    if len(sys.argv) == 7 and sys.argv[1] == "serve":
+        sys.exit(serve(int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]))
+    print("usage: monitor.py serve FD WORKDIR POLICY_HASH VOW_HASH QUARANTINE (started by RemoteMonitor)",
+          file=sys.stderr)
     sys.exit(2)

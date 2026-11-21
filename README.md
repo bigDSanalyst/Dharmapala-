@@ -135,13 +135,22 @@ The monitor is its own process: it runs every real call and holds the key
 that signs the record, which the agent's process never sees. To
 check the records against the ledger and that chain:
 
-    python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl
+    python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl \
+        --quarantine ledger.json.quarantine
 
 Each run needs its own `--ledger`. If the ledger or run-records file is
 already there, the agent refuses to start (exit 1, naming the file) rather
 than replace one run's ledger and append to its records, which would leave
 two files that no longer describe one run. The account printed after a run
 shows only that run's calls.
+
+What was refused goes to a stream of its own, the monitor's quarantine
+stream, kept apart from the run records: every file call the monitor
+refused, and every call the agent's critic or guard refused. The monitor
+writes it and signs it, next to the ledger (`LEDGER.quarantine/SESSION/`) or
+under `--quarantine DIR`, and the agent's process, once confined, cannot
+write there. `verify.py check` checks it against the monitor's key, with
+`--quarantine` as above.
 
 ### A model on your own hardware
 

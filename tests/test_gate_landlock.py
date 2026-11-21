@@ -92,6 +92,7 @@ def test_a_workdir_the_gate_must_keep_reaching_is_refused_before_anything_runs(t
     try:
         r = subprocess.run([sys.executable, str(ROOT / "guarded_agent.py"), "task", "--workdir", str(work),
                             "--backend", "openai-compatible", "--model", "m", "--ledger", str(ledger),
+                            "--quarantine", str(tmp_path / "q"),        # not next to the ledger: see below
                             "--base-url", f"http://127.0.0.1:{srv.server_port}/v1"],
                            capture_output=True, text=True, timeout=120, env=dict(os.environ, TMPDIR=str(tmp_path)))
     finally:
@@ -100,6 +101,24 @@ def test_a_workdir_the_gate_must_keep_reaching_is_refused_before_anything_runs(t
     assert r.returncode == 1 and "not starting: the workdir" in r.stderr and "overlaps" in r.stderr, r.stderr
     assert srv.seen == []                                          # the model was never asked
     assert not ledger.exists() and not os.path.exists(str(ledger) + ".runs.jsonl")
+
+
+def test_a_quarantine_inside_the_workdir_is_refused_before_anything_runs(tmp_path):
+    """With the ledger in the workdir, the quarantine stream next to it would
+    be there too, where the calls reach: the monitor will not start on it."""
+    from tests.test_backends import reply
+    srv = _serve((200, reply("done")))
+    work = tmp_path / "w"; work.mkdir(); ledger = work / "l.json"
+    try:
+        r = subprocess.run([sys.executable, str(ROOT / "guarded_agent.py"), "task", "--workdir", str(work),
+                            "--backend", "openai-compatible", "--model", "m", "--ledger", str(ledger),
+                            "--base-url", f"http://127.0.0.1:{srv.server_port}/v1"],
+                           capture_output=True, text=True, timeout=120, env=dict(os.environ, TMPDIR=str(tmp_path)))
+    finally:
+        srv.shutdown(); srv.server_close()
+    assert r.returncode == 1 and "Traceback" not in r.stderr, r.stderr
+    assert "not starting:" in r.stderr and "the quarantine directory" in r.stderr and "overlaps the workdir" in r.stderr
+    assert srv.seen == [] and sorted(os.listdir(work)) == []                  # nothing was asked, or left
 
 
 @needs_jail

@@ -72,7 +72,24 @@ def check_anchors(ledger, anchor_dir):
              for e in anchoring.load_log(Path(anchor_dir) / "log.jsonl") if e.get("status") != "confirmed"]
     return failures, looks
 
-def check(path, pins, anchors=None, runs_path=None):
+def check_quarantine(folder, verifier):
+    """What is wrong with the quarantine stream under `folder`: a session's
+    directory, or one holding sessions' directories (monitor.py)."""
+    import monitor
+    folder = Path(folder)
+    sessions = [folder] if (folder / "checkpoint.json").is_file() else \
+        sorted(p for p in folder.iterdir() if p.is_dir()) if folder.is_dir() else []
+    if not sessions: return [f"{folder} holds no quarantine stream"]
+    problems = []
+    for d in sessions:
+        try:
+            records, checkpoint = monitor.load_quarantine(d)
+            monitor.check_quarantine(records, checkpoint, verifier, d.name)
+        except (OSError, ValueError) as e:            # SessionError and bad JSON among them
+            problems.append(f"{d.name}: {e}")
+    return problems
+
+def check(path, pins, anchors=None, runs_path=None, quarantine=None):
     """Returns (ok, lines, findings) - lines are the reasons, in order."""
     from doctor import observe_with_drift
     from ledger import KeyMismatch, Ledger
@@ -109,6 +126,10 @@ def check(path, pins, anchors=None, runs_path=None):
         import runs
         try: lines += [f"runs: {p}" for p in runs.verify(runs.load(runs_path), L)]
         except runs.RunsError as e: lines.append(f"runs: {e}")
+    if quarantine is not None:
+        mon = L.verifiers.get("Monitor")
+        if mon is None: lines.append("quarantine: this ledger names no Monitor key to check it against")
+        else: lines += [f"quarantine: {p}" for p in check_quarantine(quarantine, mon)]
     return not lines, lines, findings
 
 def main(argv=None):
@@ -119,6 +140,8 @@ def main(argv=None):
     ap.add_argument("--pin", action="append", help="SIGNER=KEYID (repeatable)")
     ap.add_argument("--anchors", type=Path, help="anchoring.py's directory for this ledger")
     ap.add_argument("--runs", type=Path, help="a guarded agent's run records for this ledger (runs.py)")
+    ap.add_argument("--quarantine", type=Path,
+                    help="the monitor's quarantine stream for this ledger (LEDGER.quarantine, monitor.py)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     try:
@@ -132,7 +155,7 @@ def main(argv=None):
                     print(f"{sid:20s} {scheme:14s} {kid or '(no public key: shared secret)'}")
             return 0
         pins = read_pins(args.pins, args.pin)
-        ok, reasons, findings = check(args.ledger, pins, args.anchors, args.runs)
+        ok, reasons, findings = check(args.ledger, pins, args.anchors, args.runs, args.quarantine)
     except (OSError, ValueError, KeyError, TypeError) as e:
         # A file this tool cannot read is not a ledger that failed: say which.
         msg = f"cannot verify {args.ledger}: {e.__class__.__name__}: {e}"

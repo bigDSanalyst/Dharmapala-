@@ -159,8 +159,10 @@ class Gate:
             last = critic.attempts[-1] if critic.attempts else {}
             if last.get("unchecked"):
                 return self._out(call_id, name, args, "refused", f"the critic could not check this call ({last['unchecked']}); nothing ran")
+            violations = last.get('violations') or ['(unnamed)']
+            self._report("vow", "forbidden:" + ",".join(violations), name, args)
             return self._out(call_id, name, args, "refused",
-                             f"refused before running: it would have effects the policy forbids: {', '.join(last.get('violations') or ['(unnamed)'])}")
+                             f"refused before running: it would have effects the policy forbids: {', '.join(violations)}")
         # 2. Run it for real, after the co-signer has copied the workdir for itself.
         snap = self.co_signer.snapshot(self.workdir) if name == "shell" and self.co_signer.reexecute else None
         try: return self._run(call_id, name, args, plan, predicted, snap)
@@ -183,6 +185,7 @@ class Gate:
                                     self.binary_path, self.binary_hash)
         # 4. Only a lawful run's output goes back to the model.
         if verdict.kind != VerdictKind.LAWFUL:
+            self._report("guard", verdict.kind.name, name, args)
             hit = sorted(set(observed) & set(forbidden_of(self.vow)))
             why = f"the run showed {', '.join(hit)}, which the policy forbids" if hit else verdict.reason
             return self._out(call_id, name, args, verdict.kind.name.lower(),
@@ -191,6 +194,14 @@ class Gate:
                              evidence=action._evidence, withheld=True)
         return self._out(call_id, name, args, "lawful", _render(name, calls[-1][2]), error=False,
                          evidence=action._evidence)
+
+    def _report(self, layer, reason, name, args):
+        """A refusal this gate decided, into the monitor's quarantine stream
+        (docs/monitor-boundary.md, section 5). The session stays live."""
+        report = getattr(self.monitor, "report_refusal", None)
+        if report is None: return
+        try: report(layer, reason[:monitor_mod.Q_REASON], monitor_mod.canon({"op": name, "args": args}))
+        except monitor_mod.MonitorGone: pass            # nothing more runs anyway
 
     def _out(self, call_id, name, args, outcome, detail, error=True, evidence=None, withheld=False):
         self.log.append((name, args, outcome, detail))
@@ -242,9 +253,11 @@ class GuardedAgent:
             self.backend.reply([(i, *self.gate.run(i, name, args)) for i, name, args in turn.calls])
         return False, f"stopped after {self.max_turns} turns"
 
-def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_path=None):
+def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_path=None, quarantine=None):
     """The gate and its ledger. The co-signer vouches under the same policy
-    the gate judges by: a gate given another policy would be refused."""
+    the gate judges by: a gate given another policy would be refused.
+    quarantine: the directory the monitor writes its quarantine stream under
+    (in memory without one)."""
     policy = policy_mod.of(policy)
     vow = parse_vow(vow_source)
     ledger = Ledger(sangha_id="agent", path=ledger_path)
@@ -257,7 +270,7 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     # runs as its own process, holding a key this one never sees, whenever
     # ML-DSA-65 is installed; without it a key would have to be shared, so it
     # runs here, under the same HMAC fallback as the other signers.
-    mon = monitor_mod.start(workdir, policy_hash=policy.hash(), vow_hash=vow.hash())
+    mon = monitor_mod.start(workdir, policy_hash=policy.hash(), vow_hash=vow.hash(), quarantine=quarantine)
     ledger.register_verifier(mon.verifier)
     # The co-signer's snapshots and replays run in a monitor process of its
     # own, not the gate's (docs/monitor-boundary.md, P2 "replays through its own P0").
@@ -278,6 +291,9 @@ def main(argv=None):
     ap.add_argument("--ledger", help="write the ledger here")
     ap.add_argument("--runs", help="write the run records here (default: next to the ledger, "
                                    "LEDGER.runs.jsonl; without a ledger, kept in memory)")
+    ap.add_argument("--quarantine", help="write the quarantine stream (the refused calls, signed by the "
+                                         "monitor) under this directory (default: next to the ledger, "
+                                         "LEDGER.quarantine; without a ledger, kept in memory)")
     ap.add_argument("--max-turns", type=int, default=20)
     ap.add_argument("--no-reconcile", action="store_true",
                     help="do not show the model where its answer and the record differ")
@@ -311,10 +327,17 @@ def main(argv=None):
             return 1
     if args.ledger and runs_path and os.path.abspath(args.ledger) == os.path.abspath(runs_path):
         print("--ledger and --runs name the same file; give each its own", file=sys.stderr); return 1
-    gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path)
+    args.quarantine = args.quarantine or (args.ledger + ".quarantine" if args.ledger else None)
+    try:
+        gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path,
+                             quarantine=args.quarantine)
+    except (monitor_mod.MonitorGone, monitor_mod.QuarantineError) as e:
+        print(f"not starting: {e}", file=sys.stderr); return 1
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)
-    why_not = _confine(gate, ledger, workdir, args.ledger, runs_path, anthropic=args.backend == "anthropic")
+    private = [os.path.join(args.quarantine, gate.monitor.session)] if args.quarantine else []
+    why_not = _confine(gate, ledger, workdir, args.ledger, runs_path, anthropic=args.backend == "anthropic",
+                       private=private)
     if why_not is not None: return why_not
     if args.backend == "openai-compatible":
         backend = backends.OpenAICompatibleBackend(args.base_url, args.model, SYSTEM, TOOLS,
@@ -341,14 +364,15 @@ def main(argv=None):
         print("no API credentials: set ANTHROPIC_API_KEY or run `ant auth login`", file=sys.stderr); return 1
     return _report(gate, ledger, pol, workdir, args, finished, text, first)
 
-def _confine(gate, ledger, workdir, ledger_path, runs_path, anthropic=False):
+def _confine(gate, ledger, workdir, ledger_path, runs_path, anthropic=False, private=()):
     """Put this process under Landlock (gate_confine.py), now that its
     monitors are running: from here on it cannot open the workdir, and every
     call reaches it through a monitor. Returns None to go on, or the exit code.
     The files it must still write are made first, as a valid empty ledger and
     an empty run-records file, so no directory needs to stay writable.
     anthropic: the model is called through the anthropic SDK, whose stored
-    login (`ant auth login`) the gate must keep reaching."""
+    login (`ant auth login`) the gate must keep reaching. private: the
+    monitor's quarantine directory, which the gate must not be able to write."""
     import gate_confine
     if not isinstance(gate.monitor, monitor_mod.RemoteMonitor):
         print("warning: the monitor runs in this process (no ML-DSA-65), so this process cannot be confined",
@@ -358,7 +382,7 @@ def _confine(gate, ledger, workdir, ledger_path, runs_path, anthropic=False):
     if ledger_path: ledger._persist()
     if runs_path: open(runs_path, "a").close()
     try:
-        gate_confine.confine_gate(workdir, files=made, anthropic=anthropic)
+        gate_confine.confine_gate(workdir, files=made, anthropic=anthropic, private=private)
     except gate_confine.Unavailable as e:
         print(f"warning: the gate is not confined ({e}); it can open the workdir", file=sys.stderr)
         return None
@@ -435,6 +459,11 @@ def _report(gate, ledger, pol, workdir, args, finished, text, first=None):
         for line in differ: print("  " + line)
     elif first and finished:
         print("\nafter reconciling, the answer and the record agree where they can be compared")
+    q = getattr(gate.monitor, "quarantine_records", None)
+    if q is not None:
+        folder = getattr(args, "quarantine", None)
+        where = os.path.join(folder, gate.monitor.session) if folder else "kept in memory"
+        print(f"quarantine: {len(q)} refused call(s) ({where})")
     print(f"workdir: {workdir}" + (f"  ledger: {args.ledger}" if args.ledger else "")
           + (f"  runs: {gate.runs.path}" if gate.runs.path else "")
           + f"  policy: {pol.hash()[:16]}  integrity: {'ok' if ledger.verify_integrity() else 'BROKEN'}")

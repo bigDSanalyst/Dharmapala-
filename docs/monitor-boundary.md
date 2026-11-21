@@ -433,6 +433,33 @@ P0 records refused tool calls and tripwire events to a separate, append-only qua
 }
 ```
 
+*As built (slice 4a):* `monitor.Quarantine`, in the monitor process.
+- **What goes in:**
+  - P0's own cw_vfs refusals: every file call cw_vfs refused, in the real workdir. `reason` is the
+    errno's name (`EXDEV` for a `../` or absolute path outside, `ENOENT` for a missing file), or the
+    exception's when there is none. `record_index` names the call's record in the session chain.
+  - The Vow and guard refusals the gate decides, reported over IPC (the `quarantine` operation):
+    `forbidden:<effects>` for a call the critic refused before it ran, and the verdict for a run the
+    guard withheld.
+  - P0 accepts only those two layers from the gate, with a reason of at most 128 characters and a
+    context hash or none. Anything else is a protocol violation.
+- **What is kept:** each record is the schema above, with `call_sha256` and `record_index` added to
+  the trigger. `call_json` is kept up to 4096 bytes, and `call_sha256` is over all of it.
+  `artifacts`, `kernel_telemetry` and `pivot_chain` are empty for now: nothing fills them yet.
+- **Caps:** past 1000 records a session's further refusals are only counted, as `dropped`.
+- **Signed:** at every append P0 signs a checkpoint over `(session, q_index, head, terminal_mode,
+  dropped)`. `monitor.check_quarantine` checks a stream against it and the monitor's key: chained
+  from the first record, in order, none missing. `verify.py check LEDGER --quarantine DIR` runs it
+  with the ledger's pinned Monitor key.
+- **Where:** `records.jsonl` and `checkpoint.json` under `<dir>/<session>/`. From `guarded_agent`'s
+  command line, `<dir>` is `--quarantine DIR`, or next to the ledger (`LEDGER.quarantine`). Without
+  either, the stream is kept in the monitor's memory, and every reply that adds a record carries it
+  and its checkpoint, as replies carry session records.
+- **Refused at startup:** a quarantine directory that overlaps the workdir (P0 will not start), or
+  one the confined gate could write (under `/dev`, say).
+- **The session stays live:** a refusal is recorded, and the next call runs. The latch is slice 4b.
+- **Not yet:** refused syscalls are in the raw trace and in each run's events, not in the stream.
+
 #### P0 enforcement and tripwire invariants
 
 - **Isolated from BoundedDebt:**
@@ -522,14 +549,15 @@ This needs a decision first (§8, item 1).
   *Done, in-process:* `monitor.py` (slice 1).
 - Apply Landlock to P1 so it cannot open the workdir. *Done (slice 3b):* `gate_confine.py`.
 - Replace every `getattr` dispatch with a table (F4). *Done:* `tools.dispatch`.
-- Add the quarantine stream and the terminal capture latch (§5).
+- Add the quarantine stream and the terminal capture latch (§5). *Done (slice 4a):* the stream
+  (`monitor.Quarantine`). The latch is slice 4b.
 - Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
   *Done:* `tests/test_refused_calls.py`.
 - Exit:
   - a test shows P1 cannot open the workdir (`tests/test_gate_landlock.py`: not directly, through
     `/proc/self/root`, or through a symlink of its own, while every call still runs);
   - every operation appears in a verified chain, and a tampered record fails `verify.py`;
-  - a refused call appears in the quarantine stream;
+  - a refused call appears in the quarantine stream (`tests/test_quarantine.py`);
   - after a tripwire, P0 can neither open the workdir nor start a jail.
 
 **Phase 3: keys out of P1.**

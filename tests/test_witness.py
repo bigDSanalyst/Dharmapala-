@@ -111,6 +111,7 @@ COMMANDS = [
     "(echo x | wc) ; kill -9 -1; true",
     "python3 -c 'import socket; s = socket.socket(); s.settimeout(0.2)\ntry: s.connect((\"10.9.8.7\", 80))\nexcept OSError: pass'",
     "echo \"a, b) = c\" > 'odd, name'; cat 'odd, name' $(echo /etc/passwd)",
+    "id -un; ls -l /etc/hostname",      # name lookups: socket(AF_UNIX) attempts the filter refuses
 ]
 
 @needs_jail

@@ -16,7 +16,8 @@ the openat2 run is lawful and the model receives the file. Exit 1.
 On main since #26: the jail's seccomp filter makes openat2 fail with ENOSYS,
 so the model receives no key material. Exit 0. Landlock would refuse the read
 too, and since #27 /var/tmp is not in the jail at all. The run is still judged
-lawful, because the refused call is not in the trace.
+lawful: the refused openat2 is in the record as a "refused" event, which is
+telemetry, not an effect.
 tests/test_untraced_reads.py is the regression test.
 """
 import os

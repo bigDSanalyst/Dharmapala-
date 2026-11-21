@@ -23,6 +23,11 @@ _UNLINKS = {"unlinkat": (0, 1), "unlink": (None, 0)}   # (dirfd index, path inde
 _RENAMES = {"renameat": ((0, 1), (2, 3)), "renameat2": ((0, 1), (2, 3)),
             "rename": ((None, 0), (None, 1))}
 _WRITE_FLAGS = {"O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"}
+# Calls the jail's seccomp filter refuses: (dirfd index, path index), or None
+# for a call that names no path. socket names a domain instead.
+_REFUSABLE = {"openat2": (0, 1), "execveat": (0, 1), "name_to_handle_at": (0, 1),
+              "open_by_handle_at": None, "io_uring_setup": None, "io_uring_enter": None,
+              "io_uring_register": None, "socket": None}
 _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "v": "\v", "f": "\f", "a": "\a", "b": "\b",
             "\\": "\\", '"': '"', "'": "'", "?": "?"}
 
@@ -176,6 +181,17 @@ def parse(per_pid, cmd):
                         _resolve(args[d2] if d2 is not None else None, _strings(args[p2])[0], "", False)), ok))
             elif name == "kill":
                 if args: events.append(("kill", _text(args[0]).strip(), ok))
+            elif name in _REFUSABLE and not ok and ret.startswith("-"):
+                where = _REFUSABLE[name]
+                if name == "socket":
+                    what = _text(args[0]).strip() if args else ""
+                elif where and len(args) > where[1] and _strings(args[where[1]]):
+                    what = _resolve(args[where[0]], _strings(args[where[1]])[0], "", False)
+                else:
+                    what = ""
+                words = tail.split()
+                errno = words[0] if words and words[0][:1] == "E" else ""
+                events.append(("refused", (name, what, errno), False))
     return events
 
 class Unreadable(Exception): pass

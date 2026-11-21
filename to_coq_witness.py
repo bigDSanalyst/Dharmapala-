@@ -1,5 +1,5 @@
 
-import hashlib, json, os, shutil, subprocess, tempfile
+import contextlib, hashlib, json, os, shutil, subprocess, tempfile
 from dataclasses import dataclass, replace
 from cw_vfs import CapabilityWitness, verify_witness_against_call
 
@@ -12,6 +12,15 @@ class CoqWitness:
             raise ValueError(f"witness {self.name!r}: statement is a comment")
 
 COQC_TIMEOUT = 60.0
+
+def _remove_compiled(path):
+    """What coqc writes beside FILE.v: FILE.vo, .vok, .vos and .glob, and
+    .FILE.aux, which it names with a leading dot."""
+    stem = os.path.splitext(path)[0]
+    folder, name = os.path.split(stem)
+    for p in [stem + ext for ext in (".vo", ".vok", ".vos", ".glob")] + [os.path.join(folder, f".{name}.aux")]:
+        try: os.remove(p)
+        except OSError: pass
 
 class Certificate:
     def __init__(self, label):
@@ -31,6 +40,13 @@ class Certificate:
             lines.append("")
         with open(path, "w") as f: f.write("\n".join(lines))
         return path
+    @contextlib.contextmanager
+    def emitted(self):
+        """This certificate, written to a file in a directory of its own for
+        the length of the block. The directory goes when the block ends, and
+        with it whatever coqc wrote beside the file."""
+        with tempfile.TemporaryDirectory(prefix="pqv_") as folder:
+            yield self.emit(os.path.join(folder, f"pqv_{self.label}.v"))
     @staticmethod
     def check(path, timeout=None):
         # True: coqc accepted it. False: coqc ran and rejected it.
@@ -45,14 +61,14 @@ class Certificate:
             # execute, exec would quietly go on to the next coqc on PATH.
             proc = subprocess.run([coqc, path], capture_output=True,
                                   text=True, timeout=timeout)
-            for ext in (".vo", ".glob", ".vok", ".vos"):
-                try: os.remove(path.replace(".v", ext))
-                except FileNotFoundError: pass
             return proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
         except subprocess.TimeoutExpired:
             return None, f"coqc timed out after {timeout}s: not checked"
         except OSError as e:
             return None, f"coqc found but could not run: {e}"
+        finally:
+            # However coqc ended: a coqc that timed out may have written some.
+            _remove_compiled(path)
     def certificate_hash(self):
         # The preamble is hashed too: it defines what the statements mean.
         payload = "\n".join(self.preamble) + "||" + "|".join(
@@ -263,11 +279,8 @@ class CoSigner:
         if own.certificate_hash() != proposal.certificate_hash:
             self.notes.append("certificate: MISMATCH")
             raise RefusedToSign("certificate hash mismatch")
-        own_path = own.emit()
-        try: ok, out = Certificate.check(own_path)
-        finally:
-            try: os.remove(own_path)
-            except FileNotFoundError: pass
+        with own.emitted() as own_path:
+            ok, out = Certificate.check(own_path)
         if ok is None:
             self.notes.append("certificate: coqc unavailable")
             if self.require_coqc:

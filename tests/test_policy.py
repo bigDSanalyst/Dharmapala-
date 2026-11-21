@@ -167,7 +167,7 @@ def test_a_decision_that_names_another_policy_than_its_record_is_refused(binary)
     p = propose("G", "guard", hashlib.sha256(b"engine").hexdigest(), 0, INPUTS,
                 build_certificate("x", outputs, d), outputs, co.id, decision=d)
     with pytest.raises(RefusedToSign, match="names a policy other than the run record's"):
-        co.cosign(p, build_certificate("x", outputs, d).emit(), INPUTS, binary[0], engine,
+        co.cosign(p, "", INPUTS, binary[0], engine,
                   decision=d, evidence=a._evidence)
 
 # --- the guarded agent -----------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python3
-import os, sys, tempfile
+import os, shutil, sys, tempfile
 from vow import parse_vow, Action
 from guard import Guard
 from mirror import Adversary, Class, AdversaryEnsemble
@@ -41,7 +41,13 @@ GOALS = [
 ]
 
 def main():
+    """Run the demo in a directory of its own, removed when it ends: what it
+    returns is the ledger and the rest as objects, not its files."""
     tmpdir = tempfile.mkdtemp(prefix="sota_")
+    try: return _main(tmpdir)
+    finally: shutil.rmtree(tmpdir, ignore_errors=True)
+
+def _main(tmpdir):
     ledger = Ledger(sangha_id="alpha", path=os.path.join(tmpdir, "l.json"))
     vow = parse_vow(VOW_SOURCE)
     guard = Guard("Guard_Alpha", ledger)

@@ -123,10 +123,13 @@ class CriticLoop:
     def propose_and_verify(self, goal, workdir=None):
         context = ""
         for attempt in range(self.max_retries):
-            dry = Sandbox(tempfile.mkdtemp(), dry_run=True)
-            self.agent.sandbox = dry
-            self.agent.act(goal, context=context)
-            effects = observe(dry.calls, dry.workdir, self.policy)
+            # The dry run's directory gives its paths a workdir to be judged
+            # against: nothing is written there, and it goes once they are judged.
+            with tempfile.TemporaryDirectory() as nowhere:
+                dry = Sandbox(nowhere, dry_run=True)
+                self.agent.sandbox = dry
+                self.agent.act(goal, context=context)
+                effects = observe(dry.calls, dry.workdir, self.policy)
             rehearsed = None
             if self.rehearse:
                 rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir, self.policy,

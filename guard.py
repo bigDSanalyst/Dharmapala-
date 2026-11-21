@@ -110,13 +110,14 @@ class Guard:
         decision = Decision.of(action, vow)
         ev = getattr(action, "_evidence", None)
         cert = build_certificate(f"{self.id}_{self.ledger.next_record_index()}", outputs, decision, evidence=ev)
-        cert_path = cert.emit()
         proposal = propose(engine_id=self.id, engine_name="guard",
                            binary_hash=binary_hash, epoch=self.ledger.next_record_index(),
                            inputs=inputs, cert=cert, outputs=outputs,
                            co_signer_id=co_signer.id, decision=decision)
         try:
-            signed = co_signer.cosign(proposal, cert_path, inputs, binary_path,
+            # The co-signer checks a certificate it builds itself, never a file
+            # it is handed (to_coq_witness.CoSigner.cosign): the guard writes none.
+            signed = co_signer.cosign(proposal, "", inputs, binary_path,
                                       re_run_fn, decision=decision,
                                       evidence=getattr(action, "_evidence", None),
                                       snapshot=getattr(action, "_snapshot", None))
@@ -126,8 +127,7 @@ class Guard:
             return Verdict(VerdictKind.FAILURE_DECISION, str(e), action.id, self.id)
         except RefusedToSign as e:
             self.record_refusal(class_id=class_id, reason=str(e),
-                                notes=co_signer.notes, certificate_path=cert_path,
-                                action_digest=decision.action_digest)
+                                notes=co_signer.notes, action_digest=decision.action_digest)
             return Verdict(VerdictKind.FAILURE_REFUSAL, str(e), action.id, self.id)
         self.ledger.store_attestation(signed)
         if traj_att is not None: self.ledger.store_attestation(traj_att)

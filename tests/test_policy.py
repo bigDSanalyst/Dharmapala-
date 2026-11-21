@@ -18,7 +18,7 @@ from decision import Decision
 from guard import VerdictKind
 from observation import observe
 from signing import default_signer, verifier_for
-from tests.test_evidence import INPUTS, VOW, binary, engine, rig  # noqa: F401  (fixture)
+from tests.test_evidence import INPUTS, VOW, binary, engine, rig, witnessed_read  # noqa: F401  (fixture)
 from tests.test_jail import needs_jail
 from to_coq_witness import CoSigner, RefusedToSign, build_certificate, propose
 from vow import Action
@@ -104,7 +104,7 @@ def test_the_trace_is_judged_by_the_policy_too(tmp_path):
 # --- the record, the decision and the attestation name it ------------------------------------------
 
 def record(pol, *calls):
-    return evidence_of(list(calls) or [("file_read", {"path": ".env"}, {"ok": True})], W, {"read"}, pol)
+    return evidence_of(list(calls) or [witnessed_read(".env", "API_TOKEN=dummy\n")], W, {"read"}, pol)
 
 def act(evidence, reported=None):
     a = Action(id="a", verb="execute", domain="action")

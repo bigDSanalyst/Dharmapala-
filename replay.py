@@ -19,6 +19,7 @@
 import os, shutil, subprocess, tempfile
 
 import jail, witness
+from cw_vfs import CapabilityDirJail, ConfinementViolation, clone_confined_snapshot
 
 class Unreplayable(Exception): pass
 
@@ -31,8 +32,14 @@ def take(workdir):
     workdir = os.path.realpath(workdir)
     root = tempfile.mkdtemp(prefix="snapshot_")
     copy = os.path.join(root, "w")
-    if os.path.isdir(workdir): shutil.copytree(workdir, copy, symlinks=True)
-    else: os.mkdir(copy)
+    try:
+        if os.path.isdir(workdir):
+            clone_confined_snapshot(workdir, copy)
+        else:
+            os.mkdir(copy)
+    except ConfinementViolation as e:
+        shutil.rmtree(root, ignore_errors=True)
+        raise Unreplayable(f"workdir rejected by CW-VFS snapshot: {e}")
     return Snapshot(workdir, root, copy)
 
 def release(snapshot):
@@ -71,26 +78,44 @@ def replay(evidence, snapshot):
     scratch = tempfile.mkdtemp(prefix="replay_")
     work = os.path.join(scratch, "w")
     try:
-        shutil.copytree(snapshot.copy, work, symlinks=True)
-        calls = []
-        for tool, kwargs, result in evidence["calls"]:
-            if tool == "shell" and isinstance(result, dict) and result.get("jailed"):
-                cmd = kwargs.get("cmd", "")
-                events = witness.parse(_traced(cmd, work, workdir), cmd)
-                if events is None:
-                    raise Unreplayable("the replay's trace never shows the command starting")
-                result = {"jailed": True, "events": events}
-            elif tool == "file_write" and isinstance(result, dict) and result.get("ok"):
-                # Written in-process the first time; write it again so the
-                # calls after it see the same files. Outside the workdir it is
-                # not written again: its effect comes from its path.
-                rel = _inside(kwargs.get("path", ""), workdir)
-                if rel is not None:
-                    target = os.path.join(work, rel)
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with open(target, "w") as f: f.write(kwargs.get("content", ""))
-            calls.append((tool, kwargs, result))
+        try:
+            clone_confined_snapshot(snapshot.copy, work)
+        except ConfinementViolation as e:
+            raise Unreplayable(f"snapshot copy rejected by CW-VFS: {e}")
+        with CapabilityDirJail(work, logical_workdir=workdir) as vfs:
+            calls = []
+            for tool, kwargs, result in evidence["calls"]:
+                if tool == "shell" and isinstance(result, dict) and result.get("jailed"):
+                    cmd = kwargs.get("cmd", "")
+                    events = witness.parse(_traced(cmd, work, workdir), cmd)
+                    if events is None:
+                        raise Unreplayable("the replay's trace never shows the command starting")
+                    result = {"jailed": True, "events": events}
+                elif tool == "file_write" and isinstance(result, dict) and result.get("ok"):
+                    # Written in-process the first time; replay it via CW-VFS. The
+                    # recorded path is anchored to the workdir it names, and the
+                    # jail - not a CWD-relative guess - decides confinement: a
+                    # path outside the workdir is refused, not skipped.
+                    raw_path = str(kwargs.get("path", ""))
+                    if raw_path and not os.path.isabs(raw_path):
+                        raw_path = os.path.join(workdir, raw_path)
+                    try:
+                        raw = kwargs.get("content", "").encode("utf-8")
+                        wit = vfs.write_bytes_atomic(raw_path, raw)
+                        rec_sha = result.get("content_sha256")
+                        if rec_sha is not None and rec_sha != wit.content_sha256:
+                            raise Unreplayable(f"replayed content_sha256 {wit.content_sha256[:12]}... "
+                                               f"!= recorded {rec_sha[:12]}...: the record's write was tampered with")
+                        result = dict(
+                            result,
+                            content_sha256=wit.content_sha256,
+                            capability_witness=wit.to_dict(),
+                        )
+                    except ConfinementViolation as e:
+                        raise Unreplayable(f"replay file_write violated CW-VFS: {e}")
+                calls.append((tool, kwargs, result))
         return effects_from_evidence({"workdir": workdir, "predicted": evidence["predicted"],
+                                      "policy": evidence.get("policy"),
                                       "calls": calls})
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

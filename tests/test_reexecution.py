@@ -31,8 +31,8 @@ def forging(monkeypatch, path="/etc/shadow"):
     """The executor's jail drops every trace line that mentions `path`
     (keeping the line that starts the command, or nothing would parse)."""
     real = jail.run
-    def run(cmd, workdir, timeout=None, _probe=False):
-        ex = real(cmd, workdir, timeout, _probe)
+    def run(cmd, workdir, timeout=None, _probe=False, source=None):
+        ex = real(cmd, workdir, timeout, _probe, source=source)
         trace = {pid: "\n".join(l for l in t.splitlines() if path not in l or '"sh", "-c"' in l)
                  for pid, t in ex.trace.items()}
         return replace(ex, trace=trace, events=jail.parse(trace, cmd) or [])

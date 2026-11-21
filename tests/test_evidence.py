@@ -6,7 +6,7 @@ predicted). The co-signer re-derives the effects from the record with the one
 derivation the executor uses, and refuses to sign when they are not the
 effects the guard reports. What this does not catch: a record whose trace
 events were forged before the guard saw them. Only re-execution would."""
-import hashlib, os, tempfile
+import hashlib, os, pathlib, shutil, tempfile
 from dataclasses import replace
 
 import pytest
@@ -19,6 +19,7 @@ from ledger import Ledger
 from signing import default_signer, verifier_for
 from tests.test_jail import needs_jail
 from to_coq_witness import CoSigner, RefusedToSign, build_certificate, propose
+from tools import Sandbox
 from trajectory import TrajectoryCoSigner
 from vow import Action, parse_vow
 
@@ -46,7 +47,19 @@ def rig():
 def record(*calls, predicted=("read",)):
     return evidence_of([(t, k, r) for t, k, r in calls], W, set(predicted))
 
-HONEST = record(("file_read", {"path": "notes.txt"}, {"ok": True}))
+def witnessed_read(name, text):
+    """A file_read as a real one is recorded, capability witness included.
+    The witness is checked against its call; nothing yet binds it to the run's
+    workdir, so one taken in a scratch directory stands for one taken in W."""
+    d = tempfile.mkdtemp(prefix="evidence_"); pathlib.Path(d, name).write_text(text)
+    sb = Sandbox(d)
+    try: sb.file_read(name)
+    finally: sb.close(); shutil.rmtree(d, ignore_errors=True)
+    [call] = sb.calls
+    assert call[2]["ok"], call
+    return call
+
+HONEST = record(witnessed_read("notes.txt", "some notes\n"))
 SHADOW = record(("file_read", {"path": "/etc/shadow"}, {"ok": False}),
                 predicted=("read", "read_outside_workdir", "read_sensitive_path"))
 

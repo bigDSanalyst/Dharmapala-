@@ -3,7 +3,8 @@ import pathlib
 from cw_vfs import CapabilityDirJail
 
 class Sandbox:
-    def __init__(self, workdir, dry_run=False, jail=False, logical_workdir=None, monitor=None):
+    def __init__(self, workdir, dry_run=False, jail=False, logical_workdir=None, monitor=None,
+                 parse_trace=True):
         # jail=True: shell commands really run, inside jail.py's jail, traced.
         # Otherwise they are recorded and never run, as before. Either way a
         # dry run runs nothing.
@@ -15,6 +16,9 @@ class Sandbox:
         self._vfs = None
         # monitor: the session's record (monitor.py); every call is chained in it.
         self.monitor = None if dry_run else monitor
+        # parse_trace=False: the monitor's own sandbox runs shell commands and
+        # returns their raw trace unread; the gate parses it (monitor.py).
+        self.parse_trace = parse_trace
         if not dry_run:
             self.workdir.mkdir(parents=True, exist_ok=True)
             self._vfs = CapabilityDirJail(self.workdir, logical_workdir=logical_workdir)
@@ -69,12 +73,17 @@ class Sandbox:
                 # The copy is mounted at the logical workdir's path, so the
                 # command sees, and the trace records, the paths the evidence names.
                 same = self.logical_workdir == self.workdir
-                ex = jail.run(cmd, str(self.logical_workdir), source=None if same else str(self.workdir))
-                r = {"ok": ex.returncode == 0 and not ex.timed_out, "cmd": cmd, "jailed": True,
-                     "returncode": ex.returncode, "stdout": ex.stdout[:2000],
-                     "timed_out": ex.timed_out, "events": ex.events,
+                where = (cmd, str(self.logical_workdir))
+                if self.parse_trace:
+                    ex = jail.run(*where, source=None if same else str(self.workdir))
+                    rc, out, to, per_pid = ex.returncode, ex.stdout, ex.timed_out, ex.trace
+                else:
+                    rc, out, _, per_pid, to = jail.run_raw(*where, source=None if same else str(self.workdir))
+                r = {"ok": rc == 0 and not to, "cmd": cmd, "jailed": True,
+                     "returncode": rc, "stdout": out[:2000], "timed_out": to,
                      # the raw trace, so a co-signer can read it with its own parser (witness.py)
-                     "trace": {str(pid): text for pid, text in ex.trace.items()}}
+                     "trace": {str(pid): text for pid, text in per_pid.items()}}
+                if self.parse_trace: r["events"] = ex.events
             except jail.JailUnavailable as e:
                 r = {"ok": False, "cmd": cmd, "jailed": False, "error": f"not run: {e}"}
         else:
@@ -89,8 +98,9 @@ class Sandbox:
 # the model sees it (tests/test_dispatch.py keeps the two in step).
 TOOL_ARGS = {"file_read": ("path",), "file_write": ("path", "content"),
              "shell": ("cmd",), "http_get": ("url",)}
-_DISPATCH = {"file_read": Sandbox.file_read, "file_write": Sandbox.file_write,
-             "shell": Sandbox.shell, "http_get": Sandbox.http_get}
+# tool -> the method that runs it, on a Sandbox or anything with its interface
+# (monitor.RemoteSandbox): a name from this table, never one a plan supplies.
+_DISPATCH = {"file_read": "file_read", "file_write": "file_write", "shell": "shell", "http_get": "http_get"}
 
 class UnknownCall(ValueError):
     """A plan step that is not a call to one of the four tools with exactly its arguments."""
@@ -105,4 +115,4 @@ def check_call(tool, kwargs):
 def dispatch(sandbox, tool, kwargs):
     """Run one call on `sandbox` through the table."""
     check_call(tool, kwargs)
-    return _DISPATCH[tool](sandbox, **kwargs)
+    return getattr(sandbox, _DISPATCH[tool])(**kwargs)

@@ -150,6 +150,18 @@ def run(cmd, workdir, timeout=None, _probe=False, source=None):
     """Run `cmd` with sh inside the jail, traced. Raises JailUnavailable
     rather than ever running it any other way. source: a directory to mount at
     the workdir's path in its place (a rehearsal's copy, see _bwrap)."""
+    rc, out, err, per_pid, to = run_raw(cmd, workdir, timeout, source)
+    events = parse(per_pid, cmd)
+    if not _probe and events is None:
+        refused = [l for l in err.splitlines() if l.startswith("dharma-jail:")]
+        if refused: raise JailUnavailable(refused[-1])
+        raise JailUnavailable("the trace never shows the command starting; not trusting an unobserved run")
+    return Execution(rc, out, err, events or [], trace=per_pid, timed_out=to)
+
+def run_raw(cmd, workdir, timeout=None, source=None):
+    """Run `cmd` in the jail and return (returncode, stdout, stderr, {pid:
+    raw trace}, timed_out) without reading the trace: the monitor runs
+    commands this way and parses nothing (monitor.py); the gate parses."""
     if shutil.which("bwrap") is None or shutil.which("strace") is None:
         raise JailUnavailable("bwrap and strace are both required; not running the command")
     timeout = TIMEOUT if timeout is None else timeout
@@ -170,12 +182,7 @@ def run(cmd, workdir, timeout=None, _probe=False, source=None):
         per_pid = {int(f.rsplit(".", 1)[1]): open(os.path.join(tdir, f)).read()
                    for f in os.listdir(tdir) if f.startswith("t.")}
     finally: shutil.rmtree(tdir, ignore_errors=True)
-    events = parse(per_pid, cmd)
-    if not _probe and events is None:
-        refused = [l for l in err.splitlines() if l.startswith("dharma-jail:")]
-        if refused: raise JailUnavailable(refused[-1])
-        raise JailUnavailable("the trace never shows the command starting; not trusting an unobserved run")
-    return Execution(rc, out, err, events or [], trace=per_pid, timed_out=to)
+    return rc, out, err, per_pid, to
 
 _LINE = re.compile(r"^(\w+)\((.*)\)\s+=\s+(-?\d+|\?)(.*)$")
 _STR = re.compile(r'"((?:[^"\\]|\\.)*)"')

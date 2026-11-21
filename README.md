@@ -115,7 +115,9 @@ With `--ledger`, the records are saved next to the ledger as
 the digest the ledger signed. The output of a call withheld from the model
 is not written there either; only its digest is kept. Each run also carries
 the monitor's signed session record (`monitor.py`): every real call in one
-hash chain, and every file call's witness bound to the session's workdir. To
+hash chain, and every file call's witness bound to the session's workdir.
+The monitor is its own process: it runs every real call and holds the key
+that signs the record, which the agent's process never sees. To
 check the records against the ledger and that chain:
 
     python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl

@@ -152,6 +152,11 @@ under `--quarantine DIR`, and the agent's process, once confined, cannot
 write there. `verify.py check` checks it against the monitor's key, with
 `--quarantine` as above.
 
+A request from the agent's process that is not exactly a known operation,
+or a failure of the monitor's own, captures the monitor for good. It closes
+the workdir, restricts itself to the quarantine stream, records and signs
+the capture, and refuses every call after.
+
 ### A model on your own hardware
 
     python3 guarded_agent.py "..." --workdir DIR --backend openai-compatible \

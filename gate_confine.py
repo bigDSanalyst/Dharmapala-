@@ -198,6 +198,18 @@ def _restrict(libc, abi, rules):
         os.close(rfd)
 
 
+def restrict(rules):
+    """Restrict this process for good to `rules`, [(path, rights)], and
+    nothing else: what the monitor does to itself when it is captured
+    (monitor.capture). Unavailable if this kernel has no Landlock."""
+    libc = C._libc()
+    abi = libc.syscall(C.SYS_LANDLOCK_CREATE_RULESET, None, 0, C.LANDLOCK_CREATE_RULESET_VERSION)
+    if abi < 1: raise Unavailable("this kernel has no Landlock")
+    try: _restrict(libc, abi, rules)
+    except C.Refused as e:
+        raise e if isinstance(e, Refused) else Refused(str(e)) from None
+
+
 def confine_gate(workdir, files=(), anthropic=False, private=()):
     """Restrict this process for good. Returns its scratch directory, now TMPDIR.
     private: directories that are another process's to write (the monitor's

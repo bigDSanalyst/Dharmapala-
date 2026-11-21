@@ -109,11 +109,14 @@ def _req(**over):
     struct.pack(">I", monitor.MAX_REQUEST + 1),                    # refused before its payload arrives
 ], ids=["not-json", "not-canonical", "unknown-op", "extra-arg", "missing-arg", "not-a-string",
         "unknown-space", "close-the-real-space", "unknown-kind", "out-of-sequence", "bool-seq", "wrong-version", "oversize"])
-def test_a_request_that_is_not_exactly_a_known_operation_ends_the_monitor(remote, frame):
+def test_a_request_that_is_not_exactly_a_known_operation_captures_the_monitor(remote, frame):
+    """Nothing runs after it: the monitor is captured (tests/test_capture.py),
+    and it is gone once the gate hangs up."""
     remote._sock.sendall(frame)
-    assert remote._proc.wait(timeout=10) == monitor.PROTOCOL_EXIT
     with pytest.raises(monitor.MonitorGone):
         remote.call("http_get", space="real", url="https://example.org/")
+    remote.close()
+    assert remote._proc.returncode == monitor.PROTOCOL_EXIT
 
 
 def test_a_well_formed_request_is_answered_and_recorded(remote):

@@ -110,10 +110,14 @@ def test_the_gate_reports_a_run_the_guard_withheld(tmp_path):
 ], ids=["cw_vfs", "ipc", "no-reason", "long-reason", "bad-context", "upper-hex"])
 def test_the_gate_reports_only_its_own_refusals(remote, args):
     """It decides Vow and guard refusals; cw_vfs, IPC and jail ones are the
-    monitor's own. Anything else is not a refusal it may report."""
-    with pytest.raises(monitor.MonitorGone):
+    monitor's own. Anything else is not a refusal it may report: a protocol
+    violation, which captures the monitor (tests/test_capture.py)."""
+    with pytest.raises(monitor.MonitorCaptured):
         remote.call("quarantine", **args)
-    assert remote._proc.wait(timeout=10) == monitor.PROTOCOL_EXIT
+    [last] = remote.quarantine_records                         # nothing reported was kept
+    assert (last["terminal_mode"], last["trigger"]["layer"]) == ("captured", "ipc")
+    remote.close()
+    assert remote._proc.returncode == monitor.PROTOCOL_EXIT
 
 
 def _local(tmp_path, folder=True):

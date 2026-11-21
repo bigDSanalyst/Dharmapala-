@@ -1,0 +1,430 @@
+# Monitor boundary: design
+
+Status: design for Phases 2 to 4. Written against `main` at `676760e` (2026-11-20) and updated
+at `bb926a5` (2026-11-21), after Phases 0 and 1 landed in #25 to #29. Each result marked *verified*
+names the commit it was run against, on Linux 6.18 with bubblewrap, strace, Coq 8.18, Lean 4.14.0
+and ML-DSA-65 installed. At `676760e`, `main` was green there: 592 passed, 20 skipped (agentdojo,
+the anthropic SDK and ots not installed), with `DHARMA_REQUIRE_JAIL=1`.
+
+Supporting file, in `docs/monitor-boundary/`:
+
+- `repro_openat2.py`: end-to-end reproduction of finding F1 (reads only a dummy file). The model
+  receives the file at `676760e` and not on `main` since #26. `tests/test_untraced_reads.py` is the
+  regression test CI runs.
+
+The Phase 1 prototype (`jail_landlock.py`) is not included: `confine.py` replaced it in #26.
+
+## 1. Where the boundaries are
+
+| Component | Runs in | Can reach |
+|---|---|---|
+| The model (the agent) | remote, behind the API | this host only through `Gate.run` |
+| `Gate`, critic (Lean), guard, ledger, `observation`, trace parsing (`witness`) | one Python process | everything the user can |
+| `CoSigner`, `TrajectoryCoSigner` | the same process | both ML-DSA-65 signing keys |
+| `file_read`, `file_write` | the same process, through `cw_vfs` (#28) | regular files beneath the workdir, opened with `openat2` from a pinned descriptor |
+| `shell` commands | bubblewrap jail with Landlock and seccomp (`confine.py`, #26, #27), traced by strace | the system directories and listed `/etc` entries, read-only; the workdir, read-write |
+
+At `676760e` the jail bound the whole host root read-only, and the file tools resolved paths in
+userspace.
+
+What already holds, and should be kept as it is:
+
+- `Gate.run` accepts only the four tools, with exactly their argument names and string values.
+- Untrusted code only ever runs inside the jail: `--unshare-all`, `--cap-drop ALL`, `--clearenv`,
+  `--die-with-parent`, a private `/tmp`, Landlock and seccomp. `containment_mutants.py` breaks each
+  one and checks that a probe catches it, testing the bubblewrap layer and the `confine.py` layer
+  each with the other switched off.
+
+So the model cannot reach `Sandbox`, the workdir descriptor or a key directly. Of the two boundaries
+inside the host that needed work, one is closed for containment and one is open:
+
+1. **Jail → observation.** The guard judges what strace shows, and strace is told to show 15 syscalls.
+   Since #26, the calls that open or execute a file without passing through one strace shows
+   (`openat2`, `execveat`, `io_uring_*`, file handles) fail, and Landlock bounds what any call can
+   reach (F1). A refused attempt still leaves nothing in the trace, so a run that tried one is
+   judged `lawful`. Recording those attempts is part of Phase 2 (§5, "Quarantine stream").
+2. **Parsing → keys.** Open (F2): the process that parses attacker-influenced bytes (traces, file
+   contents, model output) also holds both signing keys.
+
+## 2. Findings
+
+| | Finding | Status |
+|---|---|---|
+| F1 | Reads through untraced syscalls never reach the guard | fixed in #26 |
+| F2 | Signing keys share an address space with the parsers | open: Phase 3 |
+| F3 | Witnesses are not bound to the session's workdir | open: Phase 2 |
+| F4 | `critic_loop.execute` dispatches by name without an allowlist | open: Phase 2 |
+| F5 | cw_vfs is not in `main`, and the versions in circulation have diverged | resolved in #28 and #29 |
+| F6 | Host Unix sockets are reachable from the jail | fixed in #27 |
+
+Each finding below is written as found, at `676760e` unless it says otherwise, with its fix after it.
+
+### F1. Reads through untraced syscalls never reach the guard (verified, end to end)
+
+- `jail.SYSCALLS` traces `openat`, `open`, `execve` and others, but not `openat2`,
+  `io_uring_setup`/`io_uring_enter`, or `execveat`.
+- The jail mounts the host root read-only (`--ro-bind / /`), so anything the user can read is reachable.
+- The default Vow forbids `read_sensitive_path` but not `exec_unvetted` or `read_outside_workdir`;
+  no Vow in the repository forbids those two.
+
+Result, with the default Vow and a scripted model (`repro_openat2.py`):
+
+| Shell command | Outcome | Model receives the key |
+|---|---|---|
+| `cat ~/.ssh/<key>` (control) | refused before running (`read_sensitive_path`) | no |
+| `python3 r.py`, where `r.py` opens the same file with `openat2` | **lawful** | **yes** |
+
+Every layer agrees, because every layer reads the same trace: the critic's rehearsal, the real run,
+the guard, the co-signer's own parser, and the co-signer's replay. Independent re-derivation cannot
+catch what the evidence never contained. This is a confidentiality bypass within the threat model the
+AgentDojo evaluation tests (a prompt-injected model).
+
+**Fix (#26).** Landlock inside the jail limits reading and executing to the system directories,
+whatever syscall makes the call. seccomp makes `openat2`, `execveat`, `io_uring_*`,
+`open_by_handle_at` and `name_to_handle_at` fail with ENOSYS. At `bb926a5`, `repro_openat2.py`
+gives: control refused; the openat2 run `lawful`, and the model receives no key material (verified).
+The run is still judged `lawful` because the refused call is not in the trace: containment holds,
+but the attempt goes unseen.
+
+### F2. Signing keys share an address space with the parsers
+
+`guarded_agent.setup` builds `CoSigner(default_signer(...))` and `TrajectoryCoSigner(...)` in the same
+process that parses strace text (`witness.py`, `jail.parse`), file contents and model output. A logic or
+memory-safety bug in any of that code can make the co-signer sign anything, or leak a key for later use.
+The co-signer's independence is logical, not a separate process.
+
+### F3. Witnesses are not bound to the session's workdir
+
+`verify_witness_against_call` (in the cw_vfs branch) checks a witness against its call and against
+itself. Nothing compares `root_dev`, `root_ino` or `fd_realpath` with the workdir the run was for, so a
+well-formed witness from any root verifies.
+
+Still true at `bb926a5`, where the function is in `cw_vfs.py` (#28). The session header (§5) closes it.
+
+### F4. `critic_loop.execute` dispatches by name without an allowlist
+
+`getattr(real, tool)(**kwargs)` runs any `Sandbox` attribute the plan names. Through `Gate` this is safe,
+because `Gate.run` validates the name first. Any other caller is trusted blindly: a plan naming
+`__init__` would re-root the sandbox. `_OneCall.act` has the same pattern.
+
+### F5. cw_vfs is not in `main`, and the versions in circulation have diverged (verified)
+
+There are two lines:
+
+- **v2 patch** (`cw_vfs_dharmapala_final_v2.patch`): integration with `tools`, `critic_loop`, `replay`,
+  `guard` and `to_coq_witness`, keyed `capability_witness`. It binds a write's witness to the call's own
+  content, checks `leaf_mode`, fsyncs the parent directory, and skips temp files when cloning.
+- **D12 line** (`cw_vfs_fixes.diff` and the 68-test adversarial suite): `mkdir_confined`; clone with
+  directories first, exact modes, and empty directories kept; dup'd `scandir` descriptors; and no
+  `st_dev` equality checks, so that overlayfs works.
+
+Against `main`, the v2 patch applies cleanly but:
+
+| Check | Result |
+|---|---|
+| Its own unit tests | 4 / 4 pass |
+| Adversarial suite (D12 line) | 59 pass, 9 fail: `mkdir_confined` missing (5), clone fixes missing (2), Coq definition count (1, from `leaf_mode`), write witness binding (1, where v2 is the stricter and correct rule) |
+| Repo tests: evidence, replay, rehearsal, binding, signatures, witness, runs | 39 fail, 68 pass |
+| … after adding `Sandbox.logical_workdir` (35 of the 39) | 3 fail, 104 pass |
+
+Two of the remaining three are `test_evidence` fixtures without witnesses (expected under the new rule).
+The third is a real regression: `rehearse` now records the *real* workdir as the evidence path while the
+jailed shell runs in the scratch copy, so every file a rehearsed command writes is judged
+`write_outside_workdir` and refused before running.
+
+The v2 line also still has the `st_dev` checks, so on overlayfs (Colab, Docker) it would refuse every
+file operation, which is the bug D12 fixed.
+
+**Resolution (#28, #29).**
+- #28 took the v2 patch as the base and ported D11 and D12 from the D12 line, keeping v2's stricter rules.
+- It fixed the rehearsal regression by mounting the scratch copy at the workdir's own path.
+- CI runs the overlay case for real, as root, on an overlay mounted with `xino=off` so the per-inode
+  devices appear.
+- #29 adopted the adversarial suite and changed its two tests that encoded the older rules.
+
+### F6. Host Unix sockets are reachable from the jail (verified, after #26)
+
+The jail still bound the whole host root read-only, and Landlock does not stop a `connect` to a socket
+file. So a command could talk to any host daemon whose socket it could see, such as an SSH or GPG agent
+or Docker: a test socket under `$HOME` received data sent from inside the jail. Both trace parsers
+skipped every `AF_UNIX` connect as "not the network", so the guard did not see it either.
+
+**Fix (#27).**
+- The binds are narrowed to the system directories and listed `/etc` entries.
+- seccomp makes `socket(AF_UNIX, …)` fail with EPERM. It compares only the low 32 bits of the domain,
+  as the kernel does. `socketpair` still works.
+- Both parsers report connects to named sockets.
+
+## 3. Target architecture: privilege separation
+
+The pattern is OpenSSH's privsep: the process that handles untrusted input holds no authority, and
+the process with authority handles no untrusted input.
+
+```
+        model API
+            │
+   ┌────────▼─────────┐   IPC (§4)    ┌──────────────────────────┐
+   │ P1  Gate          │──────────────▶│ P0  Monitor               │
+   │ critic, guard,    │◀──────────────│ workdir root fd (cw_vfs)  │
+   │ trace parsing,    │  results +     │ jail spawning (P3)        │
+   │ observation       │  chain records │ hash chain + ML-DSA key   │
+   │ no key; no workdir│               │ parses nothing untrusted  │
+   └────────┬─────────┘               └────────────┬─────────────┘
+            │ evidence + signed checkpoint          │ spawns
+   ┌────────▼─────────┐               ┌────────────▼─────────────┐
+   │ P2  Co-signer     │               │ P3  Jail (per shell call) │
+   │ own ML-DSA key;   │               │ bwrap + Landlock +        │
+   │ own parser;       │               │ seccomp, traced           │
+   │ replay via own P0 │               └──────────────────────────┘
+   └──────────────────┘
+```
+
+**P0, Monitor.** Small and privileged. It holds the workdir root descriptor (`CapabilityDirJail`) and
+the monitor's ML-DSA-65 key, and it:
+
+- performs `file_read` and `file_write` through cw_vfs;
+- spawns P3 for `shell`;
+- creates scratch copies for rehearsal and replay with `clone_confined_snapshot`;
+- appends every operation to a hash chain and signs checkpoints.
+
+It stores each raw trace and puts the trace's hash in the chain, but never parses it.
+
+P0 never applies Landlock to itself while it is live. The kernel refuses `mount(2)` to a process under
+a Landlock ruleset that restricts the filesystem, so a Landlocked P0 could start no jail (verified, §5).
+
+**P1, Gate.** Everything that reads untrusted bytes: the model loop, critic, trace parsing,
+observation and guard. It requests operations from P0 and holds no key. Landlock gives it no access to
+the workdir at all, so the only way to touch the workdir is through P0. It gets read access to the
+repository and toolchains, plus its own scratch directory. P1 starts no jail, so Landlock costs it
+nothing.
+
+**P2, Co-signer.** A separate process with its own key. Its input is an evidence bundle plus P0's signed
+checkpoint. It verifies the chain, the signature and each witness's binding (§5), re-derives effects with
+its own parser, and replays through its own P0 instance. Its output is the ML-DSA-65 attestation, as
+today. The trajectory co-signer follows the same pattern.
+
+**P3, Jail.** The bubblewrap jail as it is in `main` (#26, #27). `confine.py` runs inside bwrap, after
+the mounts and before the command, and applies:
+
+- **Landlock:** read and execute under `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc` and `/proc`; full access
+  under the workdir and the jail's own `/tmp` and `/dev`.
+  - If Landlock is unavailable, the jail refuses to run, the same way it refuses without bwrap: it
+    prints `dharma-jail: …` and exits 126, and `jail.run` raises `JailUnavailable`.
+  - It is enforced at the kernel's LSM layer whatever syscall the command uses, so it closes F1 for
+    containment.
+- **seccomp:** `openat2`, `execveat`, `io_uring_setup`/`io_uring_enter`/`io_uring_register`,
+  `open_by_handle_at` and `name_to_handle_at` fail with ENOSYS. So do calls under a foreign arch or the
+  x32 ABI.
+  - Programs fall back to calls the trace shows, as on a kernel without these calls. (This proposal
+    first said EPERM.)
+  - Denying the calls keeps the trace complete for judging what happens inside the allowed space.
+  - `socket(AF_UNIX, …)` fails with EPERM (F6).
+
+bwrap itself provides:
+
+- **Narrower binds** in place of `--ro-bind / /`: the system directories, plus listed `/etc` entries
+  (loader, name service, locale, certificates). `containment_mutants.py` tests them with `confine.py`
+  switched off, so they hold as defence in depth.
+
+## 4. IPC between P1 and P0
+
+- **Transport:** an `AF_UNIX` `SOCK_SEQPACKET` socketpair created by P0 and inherited by P1. P0 checks
+  `SO_PEERCRED`.
+- **Framing:** one canonical JSON object per message (sorted keys, UTF-8), at most 1 MiB. Anything else
+  closes the connection.
+- **Requests:** `{"v": 1, "seq": n, "op": OP, "args": {...}}`. `OP` is one of:
+
+  | Op | Args |
+  |---|---|
+  | `open_space` | `{"kind": "real" \| "rehearsal" \| "replay", "source": space?}` |
+  | `file_read` | `{"space", "path"}` |
+  | `file_write` | `{"space", "path", "content", "mode"}` |
+  | `shell` | `{"space", "cmd"}` |
+  | `http_get` | `{"url"}` (never fetches, as today) |
+  | `checkpoint` | `{"space"}` |
+  | `close_space` | `{"space"}` |
+
+  Argument sets are exact, as in `guarded_agent.ARGS`: unknown keys or wrong types are rejected.
+  Dispatch is a fixed table, never `getattr`.
+- **Responses:** `{"v": 1, "seq": n, "ok": bool, "result": {...}, "record": {"index", "prev", "hash"}}`.
+  P0 numbers and hashes every record; P1 never constructs one.
+- **Compatibility:** P1 keeps the `Sandbox` interface (a client wrapping the socket), so
+  `critic_loop` and `guarded_agent` change little.
+
+## 5. Records, checkpoints and binding
+
+- **Session header**, signed by P0 at start: session id (128 random bits), workdir realpath, root
+  `(dev, ino)`, resolve mask, policy hash, Vow hash, monitor code hash, monitor public key id, start
+  time, and (once Phase 4 lands) the endowment `(n, k₀, c)`.
+- **Record `i`:** `{index, prev, session, op, args_sha256, result_sha256, capability_witness | trace_sha256, time}`.
+  Its hash is SHA-256 of the canonical JSON, and `prev` chains it to record `i − 1`.
+- **Checkpoint:** ML-DSA-65 over `(session, index, head_hash)`, at the end of each tool call. One
+  signature covers every earlier record through the chain.
+- **Verification** (in `verify.py` and P2), on top of `verify_witness_against_call`:
+  - the checkpoint signature verifies;
+  - the chain recomputes;
+  - each witness's `(root_dev, root_ino)` equals the header's;
+  - each `fd_realpath` lies under the header's realpath.
+
+  Together these close F3.
+
+**Why not BLS12-381 aggregate signatures.** Dharmapala signs with ML-DSA-65, which is post-quantum.
+BLS is pairing-based and falls to a quantum attacker, so signing witnesses with it would downgrade the
+whole attestation path. With a single monitor, the hash chain plus one ML-DSA signature per checkpoint
+already gives "one signature covers many witnesses". Aggregation pays off only with several independent
+signers on the same records (for example a quorum of monitors). Revisit it then, alongside a
+post-quantum signature rather than instead of one.
+
+### Quarantine stream and terminal capture
+
+P0 records refused tool calls and tripwire events to a separate, append-only quarantine stream
+(`quarantine/<session_id>/`) rather than the main `BoundedDebt` ledger.
+- P0 performs zero parsing of traces or staging payloads; it only hashes, timestamps, writes and signs.
+- All offline forensic extraction, clustering and pivot-graph analysis run in an unprivileged process
+  holding no signing keys and no workdir descriptor.
+
+#### Canonical JSON record (`QuarantineRecord`)
+
+```json
+{
+  "v": 1,
+  "session": "<128-bit hex session id>",
+  "q_index": 0,
+  "prev_q_hash": "<sha256 of record q_index - 1, or 64x'0' for 0>",
+  "time": "<ISO-8601 UTC>",
+  "terminal_mode": "live | captured",
+  "trigger": {
+    "layer": "vow | guard | ipc | cw_vfs | jail",
+    "reason": "<machine-readable refusal code>",
+    "call_json": "<canonical JSON of refused P1 request>",
+    "context_sha256": "<sha256 of preceding prompt/file context>"
+  },
+  "artifacts": [
+    {
+      "relpath": "r.py",
+      "size": 248,
+      "sha256": "<sha256 of staging file>",
+      "blob_ref": "blobs/<sha256>"
+    }
+  ],
+  "kernel_telemetry": {
+    "trace_sha256": "<sha256 of raw strace output, or null>",
+    "trace_ref": "traces/<q_index>.strace",
+    "strace_seccomp_bpf": false
+  },
+  "pivot_chain": [0, 1]
+}
+```
+
+#### P0 enforcement and tripwire invariants
+
+- **Isolated from BoundedDebt:**
+  - Refused operations leave `recordedDebt`, `allowance` and `cumProv` untouched. In
+    `lean/BoundedDebt.lean` §9, `runWith` keeps the state unchanged on a refused step.
+  - The quarantine stream enforces its own hard caps (`max_record_bytes`, `max_blob_bytes`, `q_max`
+    entries per session), so spam cannot exhaust disk or pollute the honest session's budget.
+- **Telemetry-only syscall denials:**
+  - The blocked syscalls (`openat2`, `execveat`, `io_uring_setup`, `socket`, and the rest of
+    `confine.py`'s deny list) are added to `jail.SYSCALLS`, so they appear in the raw strace blob.
+    Today they are not traced.
+  - `--seccomp-bpf` must stay off. With it, the filter's errno outranks strace's trace stop, and the
+    refused calls vanish from the trace (verified at `bb926a5`). A test must pin it.
+  - glibc's name-service lookups make refused `socket(AF_UNIX)` calls in ordinary commands
+    (`id -un; ls -l` made several). bwrap's own setup sockets appear in the trace before the filter
+    is installed.
+  - So these events are recorded strictly as forensic telemetry, never as refusal or tripwire
+    triggers, and `jail.parse` and `witness.py` must treat them the same way.
+- **Irreversible live → captured latch (strictly terminal):** on a tripwire event, P0:
+  1. closes `real_jail._root_fd` and deletes the `real` space handle;
+  2. applies `landlock_restrict_self`, restricting P0 to the quarantine/log directory only;
+  3. writes the final `QuarantineRecord` with `terminal_mode = "captured"`, and signs the terminal
+     ML-DSA-65 checkpoint over `(session, q_index, head_hash, "captured")`;
+  4. refuses all further tool execution and spawns no further jails.
+- **Kernel constraint (verified at `bb926a5`):**
+  - Once a process is under a Landlock ruleset that restricts the filesystem, the kernel refuses it
+    `mount(2)` with EPERM, even as root.
+  - bwrap started from such a process fails at its first mount: `bwrap: Failed to make / slave:
+    Operation not permitted`.
+  - Consequently, P0 never applies Landlock to itself during live mode, and captured mode is strictly
+    terminal (no quarantine honeypot).
+- **Deferred formalization:** the Lean 4 absorbing-mode latch (`Mode := live | captured`,
+  `captured_is_absorbing`, and a finite `qLeft` budget) is deferred to Phase 4, when `BoundedDebt.lean`
+  is wired into P0.
+
+## 6. BoundedDebt hook (deferred)
+
+P0 is where the guard of `lean/BoundedDebt.lean` §9 belongs: it holds the state and sees every operation,
+so refusing there makes the budget an enforced property instead of a policy. `guard_alone_bound` is the
+theorem that check needs: any step function whose accepted transitions pass `GuardOK` keeps recorded debt
+within `n + (n + c)·k₀`, whatever operations exist.
+
+This needs a decision first (§8, item 1).
+
+## 7. Phases, for Claude Code
+
+**Phase 0: one cw_vfs, merged into `main`.** Done: #25 (BoundedDebt and its CI step), #28 (cw_vfs),
+#29 (the adversarial suite).
+- Base: the v2 patch.
+- Bring over from the D12 line: `mkdir_confined`; the directories-first clone (exact modes, empty
+  directories); dup'd `scandir` descriptors; and no `st_dev` equality in the hop walk, the leaf check,
+  the Coq statement or `verify` (`RESOLVE_NO_XDEV` enforces it).
+- Add `Sandbox.logical_workdir`.
+- Fix the rehearsal regression: mount the scratch copy at the real workdir path
+  (`jail._bwrap(workdir, source=copy)`, as `replay._traced` already does), so the trace and the evidence
+  agree on paths.
+- Give the two `test_evidence` fixtures witnesses.
+- Adopt the adversarial suite, and change its two tests that encode the older rules.
+- Add `lean/BoundedDebt.lean` and its CI step (it compiles with the pinned Lean 4.14).
+- Exit: `pytest -q` green with `DHARMA_REQUIRE_JAIL=1`; `containment_mutants.py` (unprivileged and
+  root); `run_demo.py`.
+
+**Phase 1: close F1 in the jail.** Done: #26 and #27.
+- **#26:** Landlock and the seccomp deny list, in `confine.py`.
+  - Probes for the untraced calls are in `tests/test_containment.py`.
+  - The filter is checked call by call against the kernel headers in `tests/test_confine.py`.
+  - `repro_openat2.py` became the regression test `tests/test_untraced_reads.py`.
+- **#27:** narrow binds, and Unix sockets (F6), with probes for both.
+- **`containment_mutants.py`** tests each layer with the other switched off, and catches every mutant.
+- **Differences from the plan:**
+  - The untraced calls fail with ENOSYS rather than EPERM.
+  - There is no compiled launcher: `confine.py` runs as source under the jail's own `python3 -I`.
+
+**Phase 2: P0 and IPC.**
+- Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
+- Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
+- Apply Landlock to P1 so it cannot open the workdir.
+- Replace every `getattr` dispatch with a table (F4).
+- Add the quarantine stream and the terminal capture latch (§5).
+- Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
+- Exit:
+  - a test shows P1 cannot open the workdir;
+  - every operation appears in a verified chain, and a tampered record fails `verify.py`;
+  - a refused call appears in the quarantine stream;
+  - after a tripwire, P0 can neither open the workdir nor start a jail.
+
+**Phase 3: keys out of P1.**
+- Move the co-signers into P2.
+- `PR_SET_DUMPABLE=0` in P0 and P2; seccomp in P1 denying `ptrace` and `process_vm_*`; separate uids
+  where the platform allows.
+- Exit: P1 holds no key material.
+
+**Phase 4: the BoundedDebt guard in P0**, after decision 1, with the absorbing `Mode` latch of §5.
+
+## 8. Open decisions
+
+1. **What is a commit and what is a retraction** for the budget in Dharmapala's terms? Candidates:
+   accepted plans versus rollbacks, or Vow and policy changes versus relaxations.
+2. **Who owns the ledger file:** P0, or a separate ledger process.
+3. **Separate uids for P0 and P2**, or one uid with `PR_SET_DUMPABLE=0` and seccomp.
+4. **Disclosure.** The repository is public. This document and `repro_openat2.py` describe an unfixed
+   bypass, so land Phase 1 with them or before them. *Resolved:* Phase 1 (#26, #27) landed before
+   either was published.
+5. **Who raises a tripwire.** P0 parses nothing untrusted, but most tripwires are found by parsing:
+   - a refused syscall shows only in the trace;
+   - Vow and guard refusals are decided in P1.
+
+   P0 can record what P1 reports and act on it, but it cannot check it. A compromised P1 can raise a
+   false tripwire, which ends the session (fail closed), or stay silent about a real one. `cw_vfs` and
+   IPC refusals are P0's own. The options:
+   - accept this, since P1 compromise is Phase 3's concern;
+   - give the tripwire decision a parser of its own outside P1, for example in P2.

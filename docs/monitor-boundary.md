@@ -671,8 +671,10 @@ This needs a decision first (§8, item 1).
    - With one uid, `PR_SET_DUMPABLE=0` in P0 and P2 and no capability in the confined gate, the
      gate is refused every way into their memory that `tests/test_gate_memory.py` tries, as root
      too. That needs no seccomp.
-   - Separate uids would add that the gate could not signal them. A gate that kills one ends the
-     session, which fails closed.
+   - Separate uids would add two things. The gate could not signal them; a gate that kills one ends
+     the session, which fails closed. And what they own, the workdir among it, would be out of reach
+     of an unconfined gate's file permissions too: of a library caller's, which Landlock does not
+     cover.
    - They would take root, or a helper with privilege, to start P0 and P2 as another user.
 
    *Proposed:* one uid. Still open.

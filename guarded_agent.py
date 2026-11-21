@@ -407,7 +407,8 @@ def _confine(gate, ledger, workdir, ledger_path, runs_path, anthropic=False, pri
             except OSError: pass
         print(f"not starting: {e}", file=sys.stderr)
         return 1
-    print("gate: confined (Landlock): this process cannot open the workdir; its monitors run every call",
+    print("gate: confined (Landlock): this process cannot open the workdir and holds no capability; its monitors "
+          "run every call",
           file=sys.stderr)
     return None
 

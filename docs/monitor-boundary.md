@@ -53,7 +53,7 @@ inside the host that needed work, one is closed for containment and one is open:
 |---|---|---|
 | F1 | Reads through untraced syscalls never reach the guard | fixed in #26 |
 | F2 | Signing keys share an address space with the parsers | open: Phase 3 |
-| F3 | Witnesses are not bound to the session's workdir | open: Phase 2 |
+| F3 | Witnesses are not bound to the session's workdir | fixed in-process: `monitor.py` (Phase 2) |
 | F4 | `critic_loop.execute` dispatches by name without an allowlist | fixed: `tools.dispatch` (Phase 2) |
 | F5 | cw_vfs is not in `main`, and the versions in circulation have diverged | resolved in #28 and #29 |
 | F6 | Host Unix sockets are reachable from the jail | fixed in #27 |
@@ -102,6 +102,12 @@ itself. Nothing compares `root_dev`, `root_ino` or `fd_realpath` with the workdi
 well-formed witness from any root verifies.
 
 Still true at `bb926a5`, where the function is in `cw_vfs.py` (#28). The session header (§5) closes it.
+
+**Fix (Phase 2, slice 1).** `monitor.py` signs a session header naming the workdir and its root,
+chains every real call and signs a checkpoint at the end of each run (§5). The co-signer refuses a
+run whose witness is from another root, or names a file outside the header's workdir, and so does
+`verify.py --runs`. Until the monitor is its own process (slice 2), the gate's process holds the
+monitor's key, so a fault there can still sign whatever the monitor can.
 
 ### F4. `critic_loop.execute` dispatches by name without an allowlist
 
@@ -268,8 +274,9 @@ bwrap itself provides:
 - **Session header**, signed by P0 at start: session id (128 random bits), workdir realpath, root
   `(dev, ino)`, resolve mask, policy hash, Vow hash, monitor code hash, monitor public key id, start
   time, and (once Phase 4 lands) the endowment `(n, k₀, c)`.
-- **Record `i`:** `{index, prev, session, op, args_sha256, result_sha256, capability_witness | trace_sha256, time}`.
-  Its hash is SHA-256 of the canonical JSON, and `prev` chains it to record `i − 1`.
+- **Record `i`:** `{index, prev, session, op, args_sha256, result_sha256, time}`.
+  Its hash is SHA-256 of the canonical JSON, and `prev` chains it to record `i − 1`. The result hash
+  covers the call's witness and raw trace. (This section first listed them as separate fields.)
 - **Checkpoint:** ML-DSA-65 over `(session, index, head_hash)`, at the end of each tool call. One
   signature covers every earlier record through the chain.
 - **Verification** (in `verify.py` and P2), on top of `verify_witness_against_call`:
@@ -279,6 +286,23 @@ bwrap itself provides:
   - each `fd_realpath` lies under the header's realpath.
 
   Together these close F3.
+
+**As built (slice 1, in-process).** `monitor.py`; the signer is `Monitor`, registered in the ledger
+and pinned like the other signers.
+- **The session block:** each run's evidence carries one. It holds the signed header, the checkpoint
+  the run started from, the run's records and the checkpoint it ended on. The run records file keeps
+  the block even for a withheld call: it holds only hashes, and without it the chain would have a gap.
+- **The co-signer** checks every run against the block before vouching:
+  - the signatures;
+  - the chain from one checkpoint to the next;
+  - that the records are exactly the run's calls;
+  - that the header is for its workdir and policy;
+  - the witness binding.
+- **`verify.py --runs`** checks the same offline, plus continuity: each run must start at the
+  checkpoint the session's previous run ended on, so a dropped run shows even when its output was
+  withheld.
+- **Not yet:** the co-signer keeps no state between calls, so it cannot see a run hidden from it
+  between two it was shown. `verify.py` sees that; a stateful co-signer is Phase 3 (P2).
 
 **Why not BLS12-381 aggregate signatures.** Dharmapala signs with ML-DSA-65, which is post-quantum.
 BLS is pairing-based and falls to a quantum attacker, so signing witnesses with it would downgrade the
@@ -407,6 +431,7 @@ This needs a decision first (§8, item 1).
 **Phase 2: P0 and IPC.**
 - Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
 - Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
+  *Done, in-process:* `monitor.py` (slice 1).
 - Apply Landlock to P1 so it cannot open the workdir.
 - Replace every `getattr` dispatch with a table (F4). *Done:* `tools.dispatch`.
 - Add the quarantine stream and the terminal capture latch (§5).
@@ -430,7 +455,9 @@ This needs a decision first (§8, item 1).
 
 1. **What is a commit and what is a retraction** for the budget in Dharmapala's terms? Candidates:
    accepted plans versus rollbacks, or Vow and policy changes versus relaxations.
-2. **Who owns the ledger file:** P0, or a separate ledger process.
+2. **Who owns the ledger file:** P0, or a separate ledger process. *Decided:* P0. It stores the
+   entries P1 sends as opaque bytes, size-capped and hash-chained, and never interprets them, so
+   owning the ledger does not make it a parser.
 3. **Separate uids for P0 and P2**, or one uid with `PR_SET_DUMPABLE=0` and seccomp.
 4. **Disclosure.** The repository is public. This document and `repro_openat2.py` describe an unfixed
    bypass, so land Phase 1 with them or before them. *Resolved:* Phase 1 (#26, #27) landed before

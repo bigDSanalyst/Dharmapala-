@@ -113,8 +113,10 @@ report says so.
 With `--ledger`, the records are saved next to the ledger as
 `LEDGER.runs.jsonl`: append-only and hash-chained, each run's record matching
 the digest the ledger signed. The output of a call withheld from the model
-is not written there either; only its digest is kept. To check the records
-against the ledger:
+is not written there either; only its digest is kept. Each run also carries
+the monitor's signed session record (`monitor.py`): every real call in one
+hash chain, and every file call's witness bound to the session's workdir. To
+check the records against the ledger and that chain:
 
     python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl
 

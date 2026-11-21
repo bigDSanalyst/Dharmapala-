@@ -23,7 +23,10 @@ and does not fail the check: it is recorded and waiting, which is not wrong.
 With --runs FILE (a guarded agent's run records, runs.py), `check` also fails
 unless their chain is intact, every stored record hashes to the digest its
 entry names, every entry that ran is one this ledger signed with the verdict
-it says, and every run the ledger signed has an entry.
+it says, and every run the ledger signed has an entry. Every run the monitor
+recorded (monitor.py) must be signed by the pinned Monitor key, start where the
+session's run before it ended, hold exactly its calls, and carry only
+witnesses from the session's root.
 
 Exit codes:
     0  verified

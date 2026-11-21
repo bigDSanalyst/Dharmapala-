@@ -17,7 +17,11 @@ seccomp    the system calls that open or execute a file without passing
            through a call strace traces (DENIED) fail with ENOSYS, as if the
            kernel lacked them. Programs that try them fall back to openat and
            execve, which the trace shows, so the guard judges what actually
-           happened inside the space Landlock allows.
+           happened inside the space Landlock allows. socket(AF_UNIX, ...)
+           fails with EPERM: Landlock does not stop a connect to a socket
+           file, so a host daemon's socket that the binds missed stays out of
+           reach. socketpair, which programs use among their own processes,
+           is a different call and still works.
 
 Fail closed: if either cannot be put in place, nothing runs. This prints
 "dharma-jail: <why>" and exits 126 without starting the command, and jail.py
@@ -71,11 +75,18 @@ X32_SYSCALL_BIT = 0x40000000
 SYSCALL_TABLES = {
     "x86_64": (0xC000003E, {"openat2": 437, "execveat": 322, "io_uring_setup": 425,
                             "io_uring_enter": 426, "io_uring_register": 427,
-                            "open_by_handle_at": 304, "name_to_handle_at": 303}),
+                            "open_by_handle_at": 304, "name_to_handle_at": 303, "socket": 41}),
     "aarch64": (0xC00000B7, {"openat2": 437, "execveat": 281, "io_uring_setup": 425,
                              "io_uring_enter": 426, "io_uring_register": 427,
-                             "open_by_handle_at": 265, "name_to_handle_at": 264}),
+                             "open_by_handle_at": 265, "name_to_handle_at": 264, "socket": 198}),
 }
+AF_UNIX = 1
+# socket()'s domain is a C int: the kernel reads only the low 32 bits of the
+# 64-bit argument, so the filter compares those and nothing else. Comparing all
+# 64 would let 1 | 1 << 32 through as a family the filter does not know while
+# the kernel made an AF_UNIX socket of it. Both machines here are little-endian:
+# seccomp_data.args[0] is at offset 16, its low word first.
+ARG0_LOW = 16
 DENIED = ("openat2", "execveat", "io_uring_setup", "io_uring_enter", "io_uring_register",
           "open_by_handle_at", "name_to_handle_at")
 
@@ -151,6 +162,10 @@ def seccomp_program(machine):
         prog += [(BPF_JGE_K, 0, 1, X32_SYSCALL_BIT), (BPF_RET_K, 0, 0, deny)]
     for name in DENIED:
         prog += [(BPF_JEQ_K, 0, 1, numbers[name]), (BPF_RET_K, 0, 0, deny)]
+    prog += [(BPF_JEQ_K, 0, 3, numbers["socket"]),     # not socket(): allow
+             (BPF_LD_W_ABS, 0, 0, ARG0_LOW),            # the domain's low 32 bits
+             (BPF_JEQ_K, 0, 1, AF_UNIX),
+             (BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | errno.EPERM)]
     return prog + [(BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW)]
 
 

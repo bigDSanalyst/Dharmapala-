@@ -152,7 +152,12 @@ def parse(per_pid, cmd):
             elif name == "connect":
                 if len(args) < 2: continue
                 addr = args[1]
-                if "sa_family=AF_UNIX" in _text(addr): continue
+                if "sa_family=AF_UNIX" in _text(addr):
+                    # A socket file, by path; an abstract name (sun_path=@...)
+                    # is the jail's own and is not reported.
+                    if "sun_path=@" not in _text(addr).replace(" ", "") and _strings(addr):
+                        events.append(("unix", _resolve(None, _strings(addr)[0], "", False), ok))
+                    continue
                 t = _text(addr); ips = _strings(addr)
                 if ("inet_addr(" in t or "inet_pton(" in t) and ips:
                     events.append(("connect", ips[-1], ok))

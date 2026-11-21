@@ -44,8 +44,8 @@ def test_only_the_workdir_is_writable(work, tmp_path):
 def test_the_host_filesystem_is_read_only(work):
     """The sibling above is under /tmp, which the jail replaces with its own:
     it proves only that the workdir's neighbours are not bound. This one is a
-    directory the test user can write outside /tmp (in its home), which only
-    a read-only root keeps the jail from."""
+    directory the test user can write outside /tmp (in its home). The jail does
+    not mount it at all, and Landlock allows no write there either."""
     home = pathlib.Path.home()
     assert not str(home.resolve()).startswith("/tmp"), "the probe needs a writable directory outside /tmp"
     outside = pathlib.Path(tempfile.mkdtemp(prefix=".dharma-containment-", dir=home))
@@ -130,8 +130,9 @@ def _outside_tmp():
 
 def test_only_the_system_directories_are_readable(work):
     """A file only the test user can read, in its home, as credentials are.
-    The read-only root shows it to the jail; only confine.py's Landlock ruleset
-    keeps the command from reading it."""
+    Two layers keep the command from it, and each is enough alone: the jail
+    does not mount the home directory, and confine.py's Landlock ruleset
+    allows reads only beneath the system directories."""
     outside = _outside_tmp()
     try:
         secret = outside / "credentials"
@@ -169,3 +170,68 @@ def test_calls_the_trace_cannot_see_are_refused(work):
     assert set(calls) == {"openat2", "execveat", "io_uring_setup"}, "the probe did not run"
     reached = {k: v for k, v in calls.items() if v != "ENOSYS"}
     assert not reached, f"ESCAPE: calls the trace cannot see reached the kernel: {reached}"
+
+def test_host_directories_are_not_there(work):
+    """A directory of the test's own in its home. The jail mounts only the
+    system directories and a short list of /etc's files, so the rest of the
+    host is not there at all, not even to look at (Landlock refuses a read,
+    not a look)."""
+    outside = _outside_tmp()
+    try:
+        run(f"test -e {outside} && echo VISIBLE > seen; echo ran >> seen", work)
+        seen = (work / "seen").read_text()
+        assert "ran" in seen, "the command did not run"
+        assert "VISIBLE" not in seen, "ESCAPE: the host's other directories are visible in the jail"
+    finally: shutil.rmtree(outside, ignore_errors=True)
+
+def test_only_listed_etc_entries_are_there(work):
+    """/etc in the jail holds only what jail.py lists. All of /etc would include
+    /etc/shadow and the host's SSH keys, which a jail started as root could read."""
+    run("ls -A /etc > etc", work)
+    seen = set((work / "etc").read_text().split())
+    assert "passwd" in seen, "the jail has no /etc at all"
+    extra = seen - {e.split("/")[0] for e in jail._etc_entries()}
+    assert not extra, f"ESCAPE: /etc entries the jail does not list: {sorted(extra)[:8]}"
+
+SOCKETS = """import ctypes, errno, platform, socket
+L = ctypes.CDLL(None, use_errno=True); L.syscall.restype = ctypes.c_long
+nr = {"x86_64": 41, "aarch64": 198}[platform.machine()]
+def make(domain):
+    # c_long: a bare Python int goes to a variadic C call as a 32-bit int,
+    # which would drop the high bits before the kernel ever saw them.
+    fd = L.syscall(*map(ctypes.c_long, (nr, domain, socket.SOCK_STREAM, 0)))
+    return "ok" if fd >= 0 else errno.errorcode.get(ctypes.get_errno(), "?")
+a, b = socket.socketpair(); a.send(b"x")
+seen = {"AF_UNIX": make(1), "AF_UNIX with high bits set": make(1 | 1 << 32),
+        "socketpair": "ok" if b.recv(1) == b"x" else "broken"}
+open("sockets", "w").write("\\n".join(f"{k}={v}" for k, v in seen.items()))
+"""
+
+def test_unix_sockets_cannot_be_made(work):
+    """confine.py's filter refuses socket(AF_UNIX, ...), also when the 64-bit
+    argument has high bits set, which the kernel drops (it reads an int).
+    socketpair, which programs use among their own processes, still works."""
+    (work / "probe.py").write_text(SOCKETS)
+    run("python3 probe.py", work)
+    seen = dict(l.split("=", 1) for l in (work / "sockets").read_text().splitlines())
+    assert seen.get("socketpair") == "ok", f"socketpair no longer works: {seen}"
+    made = {k: v for k, v in seen.items() if k != "socketpair" and v != "EPERM"}
+    assert not made, f"ESCAPE: a Unix socket could be made: {made}"
+
+def test_host_unix_sockets_are_unreachable(work):
+    """A Unix socket the test listens on in its home, as a host daemon's would be
+    (an SSH or GPG agent, Docker). The jail neither mounts its directory nor may
+    make a Unix socket, and each is enough alone."""
+    outside = _outside_tmp()
+    srv = socket.socket(socket.AF_UNIX)
+    try:
+        path = str(outside / "agent.sock")
+        srv.bind(path); srv.listen(1); srv.settimeout(0.5)
+        run(f"python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('{path}'); "
+            f"s.send(b'x')\"; echo ran > ran", work)
+        assert (work / "ran").exists(), "the command did not run"
+        try: conn, _ = srv.accept()
+        except socket.timeout: conn = None
+        assert conn is None, "ESCAPE: reached a Unix socket on the host"
+    finally:
+        srv.close(); shutil.rmtree(outside, ignore_errors=True)

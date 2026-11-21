@@ -172,6 +172,12 @@ class CoSigner:
         self.replay_monitor = replay_monitor
         if monitor is not None and workdir is None:
             raise ValueError("a co-signer that checks sessions needs the workdir they are for")
+        # It follows each session it is shown (docs/monitor-boundary.md, §5):
+        # every run must start at the checkpoint the last one ended on. One
+        # that does not means a run was hidden from it, which an honest gate
+        # never does, so from then on it signs nothing more in the session.
+        self._heads = {}                # session -> (index, head) where its last run ended
+        self.gone = None                # why it signs nothing more, once it does not
     def snapshot(self, workdir):
         """Copy the workdir before the run: what a replay will start from."""
         import os, replay
@@ -185,6 +191,33 @@ class CoSigner:
         and so does the gate, afterwards)."""
         import replay
         if snap is not None and snap in self._snapshots: self._snapshots.discard(snap); replay.release(snap)
+    def _follow(self, evidence, policy_hash):
+        """Check the run's session block and that the run starts where the last
+        one this co-signer was shown ended, then go on from where it ends.
+        Raises SessionError for a block that does not check, and RefusedToSign
+        once a run was hidden from it. Returns the header."""
+        import monitor as monitor_mod
+        if self.gone: raise RefusedToSign(self.gone)
+        header = monitor_mod.check_evidence(evidence, self.monitor, self.workdir, policy_hash)
+        block, session = evidence["session"], header["session"]
+        start = block.get("from_checkpoint")
+        began = None if start is None else (start["index"], start["head"])
+        if began != self._heads.get(session):
+            self.gone = (f"a run of session {session[:12]} was hidden from the co-signer: this one does not start "
+                         f"where the last one it was shown ended, so it signs nothing more in the session")
+            raise RefusedToSign(self.gone)
+        end = block["checkpoint"]
+        self._heads[session] = (end["index"], end["head"])
+        return header
+    def observe(self, evidence):
+        """A run this co-signer is not asked to vouch for, one the guard refused
+        before asking it: shown, so it can follow the session. Returns None, or
+        why it did not follow."""
+        if self.monitor is None or evidence is None: return None
+        import monitor as monitor_mod
+        try: self._follow(evidence, self.policy.hash())
+        except (monitor_mod.SessionError, RefusedToSign) as e: return str(e)
+        return None
     def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None,
                snapshot=None):
         self.notes = []
@@ -204,6 +237,11 @@ class CoSigner:
             self.notes.append("output: MISMATCH")
             raise RefusedToSign("output mismatch")
         self.notes.append("re-run output: match")
+        if self.monitor is not None and (decision is None or not decision.evidence_digest):
+            # Following a session, it vouches only for its runs: a decision
+            # that cites none would be signed outside the session's chain.
+            self.notes.append("session: NO RUN")
+            raise RefusedToSign("this co-signer follows a session, and the decision cites no run of it")
         if decision is not None:
             # Decide independently, then check the proposal says the same.
             from decision import verdict_of
@@ -236,11 +274,16 @@ class CoSigner:
                 self.notes.append("policy: accepted")
                 if self.monitor is not None:
                     import monitor as monitor_mod
-                    try: monitor_mod.check_evidence(evidence, self.monitor, self.workdir, judged_under)
+                    # From here on the run counts as shown, whatever else is refused.
+                    try: self._follow(evidence, judged_under)
                     except monitor_mod.SessionError as e:
                         self.notes.append("session: REFUSED")
                         raise RefusedToSign(f"session record: {e}")
+                    except RefusedToSign:
+                        self.notes.append("session: A RUN WAS HIDDEN")
+                        raise
                     self.notes.append("session: signed, chained, witnesses bound to its root")
+                    self.notes.append("session: follows the last run shown")
                 # Read the raw trace with the co-signer's own parser, not the
                 # events the guard's side parsed from it (witness.py).
                 import witness

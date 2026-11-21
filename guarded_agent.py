@@ -154,7 +154,9 @@ class Gate:
         # 1. The critic: dry run, and for shell a rehearsal in the jail.
         critic = CriticLoop(_OneCall(name, args), self.vow, max_retries=1, verbose=False, policy=self.policy,
                             guard=self.guard, rehearse=(name == "shell"), monitor=self.monitor)
-        predicted, ok, plan = critic.propose_and_verify(f"tool:{name}", workdir=self.workdir)
+        try: predicted, ok, plan = critic.propose_and_verify(f"tool:{name}", workdir=self.workdir)
+        except monitor_mod.MonitorGone as e:         # gone or captured, met while rehearsing
+            return self._out(call_id, name, args, "refused", f"{e}; nothing more runs in this session")
         if not ok:
             last = critic.attempts[-1] if critic.attempts else {}
             if last.get("unchecked"):

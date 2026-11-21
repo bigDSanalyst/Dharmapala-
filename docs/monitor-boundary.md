@@ -409,7 +409,7 @@ P0 records refused tool calls and tripwire events to a separate, append-only qua
   "time": "<ISO-8601 UTC>",
   "terminal_mode": "live | captured",
   "trigger": {
-    "layer": "vow | guard | ipc | cw_vfs | jail",
+    "layer": "vow | guard | ipc | cw_vfs | jail | monitor",
     "reason": "<machine-readable refusal code>",
     "call_json": "<canonical JSON of refused P1 request>",
     "context_sha256": "<sha256 of preceding prompt/file context>"
@@ -455,7 +455,8 @@ P0 records refused tool calls and tripwire events to a separate, append-only qua
   and its checkpoint, as replies carry session records.
 - **Refused at startup:** a quarantine directory that overlaps the workdir (P0 will not start), or
   one the confined gate could write (under `/dev`, say).
-- **The session stays live:** a refusal is recorded, and the next call runs. The latch is slice 4b.
+- **The session stays live:** a refusal is recorded, and the next call runs. Only the latch (slice 4b,
+  below) ends it.
 - **Not yet:** refused syscalls are in the raw trace and in each run's events, not in the stream.
 
 #### P0 enforcement and tripwire invariants
@@ -485,6 +486,23 @@ P0 records refused tool calls and tripwire events to a separate, append-only qua
   3. writes the final `QuarantineRecord` with `terminal_mode = "captured"`, and signs the terminal
      ML-DSA-65 checkpoint over `(session, q_index, head_hash, "captured")`;
   4. refuses all further tool execution and spawns no further jails.
+
+  *As built (slice 4b):* `monitor.capture`, from `serve`.
+  - **Triggers:**
+    - a protocol violation (layer `ipc`): any frame the request checks refuse, a refusal the gate
+      may not report, or a frame the monitor cannot read past;
+    - a failure of the monitor's own (layer `monitor`): an operation that raises what it does not
+      handle, a stream it cannot write among them. `reason` is the exception's class.
+  - **Steps:** it closes every space (the workdir's pinned descriptor among them), removes the copies
+    and closes any other descriptor into the workdir. Then it restricts itself with Landlock to the
+    session's quarantine directory, or to nothing when the stream is in memory. Under that it can open
+    nothing else and execute nothing, so not even bwrap. Last, it writes the terminal record and signs
+    the terminal checkpoint, both with `terminal_mode = "captured"`.
+  - **After:** every request is answered "captured", the first answer carrying the terminal record and
+    checkpoint. The gate's `RemoteMonitor` raises `MonitorCaptured`, a `MonitorGone`, so every call
+    is refused. The monitor exits when the gate hangs up, 3 after a protocol violation and 4 after a
+    failure of its own; a frame it cannot read past ends it at once.
+  - **When it cannot be captured** (no Landlock, or the capture cannot be recorded), it stops at once.
 - **Kernel constraint (verified at `bb926a5`):**
   - Once a process is under a Landlock ruleset that restricts the filesystem, the kernel refuses it
     `mount(2)` with EPERM, even as root.
@@ -534,7 +552,7 @@ This needs a decision first (§8, item 1).
   - The untraced calls fail with ENOSYS rather than EPERM.
   - There is no compiled launcher: `confine.py` runs as source under the jail's own `python3 -I`.
 
-**Phase 2: P0 and IPC.**
+**Phase 2: P0 and IPC.** *Done (slices 0 to 4b): each exit criterion below has its test.*
 - Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
   *Done (slices 2 and 3a):*
   - the monitor process and its client;
@@ -548,7 +566,7 @@ This needs a decision first (§8, item 1).
 - Apply Landlock to P1 so it cannot open the workdir. *Done (slice 3b):* `gate_confine.py`.
 - Replace every `getattr` dispatch with a table (F4). *Done:* `tools.dispatch`.
 - Add the quarantine stream and the terminal capture latch (§5). *Done (slice 4a):* the stream
-  (`monitor.Quarantine`). The latch is slice 4b.
+  (`monitor.Quarantine`). *Done (slice 4b):* the latch (`monitor.capture`).
 - Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
   *Done:* `tests/test_refused_calls.py`.
 - Exit:
@@ -556,7 +574,7 @@ This needs a decision first (§8, item 1).
     `/proc/self/root`, or through a symlink of its own, while every call still runs);
   - every operation appears in a verified chain, and a tampered record fails `verify.py`;
   - a refused call appears in the quarantine stream (`tests/test_quarantine.py`);
-  - after a tripwire, P0 can neither open the workdir nor start a jail.
+  - after a tripwire, P0 can neither open the workdir nor start a jail (`tests/test_capture.py`).
 
 **Phase 3: keys out of P1.**
 - Move the co-signers into P2.

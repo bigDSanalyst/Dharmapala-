@@ -31,7 +31,7 @@
 import hashlib, json, os, secrets, stat, time
 
 GENESIS = "0" * 64
-CODE = ("monitor.py", "tools.py", "cw_vfs.py", "jail.py", "confine.py")
+CODE = ("monitor.py", "tools.py", "cw_vfs.py", "jail.py", "confine.py", "gate_confine.py")
 
 def canon(obj): return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 def sha(obj): return hashlib.sha256(canon(obj).encode()).hexdigest()
@@ -78,8 +78,9 @@ def root_of(workdir):
 # all of it. record_index is the session record of a call the monitor ran and
 # refused (None for a refusal the gate reports). Past Q_MAX records, further
 # refusals are only counted (dropped). artifacts, kernel_telemetry and
-# pivot_chain are empty: nothing fills them yet.
-LAYERS = ("vow", "guard", "ipc", "cw_vfs", "jail")
+# pivot_chain are empty: nothing fills them yet. The last record of a captured
+# session (capture, below) has terminal_mode "captured", and so does its checkpoint.
+LAYERS = ("vow", "guard", "ipc", "cw_vfs", "jail", "monitor")
 REPORTED = ("vow", "guard")          # what the gate may report; the rest are the monitor's own
 Q_MAX = 1000
 Q_FIELD = 4096
@@ -331,7 +332,8 @@ import signal, socket, struct, subprocess, sys
 
 MAX_REQUEST = 1 << 20
 MAX_RESPONSE = 256 << 20
-PROTOCOL_EXIT = 3
+PROTOCOL_EXIT = 3          # captured on a protocol violation
+INVARIANT_EXIT = 4         # captured on a failure of its own
 # A space is where a call runs: "real", the workdir itself, whose every call
 # is recorded in the session chain; or a copy, made by open_space from the
 # real workdir or from another copy (clone_confined_snapshot) and mounted at
@@ -350,6 +352,9 @@ class SpaceError(RuntimeError):
 
 class MonitorGone(RuntimeError):
     """The monitor process is not there to answer: nothing more runs."""
+
+class MonitorCaptured(MonitorGone):
+    """The monitor is captured (capture): it refuses every call from now on."""
 
 def send_frame(sock, obj):
     data = canon(obj).encode()
@@ -401,6 +406,38 @@ def _reportable(args):
     return args["layer"] in REPORTED and 0 < len(args["reason"]) <= Q_REASON and \
         (ctx == "" or (len(ctx) == 64 and all(c in "0123456789abcdef" for c in ctx)))
 
+def capture(mon, spaces, layer, reason, call):
+    """The terminal latch (docs/monitor-boundary.md, section 5), taken on a
+    protocol violation (layer "ipc") or a failure of the monitor's own
+    ("monitor"). It closes every space, the real workdir's descriptor among
+    them, removes the copies, and closes any other descriptor into the
+    workdir (Landlock does not revoke an open one). Then it restricts this
+    process for good to its quarantine directory, or to nothing when the
+    stream is in memory: it can open no workdir and execute nothing, and a
+    process under Landlock cannot mount, so no jail can start. Last, it
+    records the capture and signs the terminal checkpoint.
+    (record, checkpoint, confined); confined is False without Landlock."""
+    import shutil, gate_confine
+    for root, sb in list(spaces.values()):
+        sb.close()
+        if root: shutil.rmtree(root, ignore_errors=True)
+    spaces.clear()
+    w = mon.header["workdir"]
+    for name in os.listdir("/proc/self/fd"):
+        try: target = os.readlink(f"/proc/self/fd/{name}")
+        except OSError: continue
+        if _within(target, w):
+            try: os.close(int(name))
+            except OSError: pass
+    try:
+        gate_confine.restrict([(mon.quarantine.dir, gate_confine.EVERYTHING)] if mon.quarantine.dir else [])
+        confined = True
+    except gate_confine.Refused:
+        confined = False
+    mon.quarantine.mode = "captured"
+    rec, cp = mon.quarantine.add(layer, reason, call)
+    return rec, cp, confined
+
 def serve(fd, workdir, policy_hash, vow_hash, quarantine=""):
     _harden()
     parent = os.getppid()
@@ -414,6 +451,7 @@ def serve(fd, workdir, policy_hash, vow_hash, quarantine=""):
     except ImportError:
         send_frame(sock, {"v": 1, "refused": "no ML-DSA-65 (pip install dilithium-py)"}); return 1
     import shutil, tempfile
+    import gate_confine  # noqa: F401  (capture's: loaded now, before there is anything it may not read)
     from cw_vfs import ConfinementViolation, clone_confined_snapshot
     try: mon = Monitor(signer, workdir, policy_hash=policy_hash, vow_hash=vow_hash, quarantine=quarantine or None)
     except (ValueError, OSError) as e:
@@ -423,12 +461,42 @@ def serve(fd, workdir, policy_hash, vow_hash, quarantine=""):
     made = 0
     send_frame(sock, {"v": 1, "hello": {"header": mon.header, "header_signature": mon.header_signature,
                                          "scheme": signer.scheme, "public": signer.public_bytes().hex()}})
-    seq = 0
+    seq, latched, ending = 0, None, 0
+
+    def latch(layer, reason, call):
+        """Capture, and tell the gate. False when the monitor cannot stay up
+        captured (no Landlock, or the capture could not be recorded): then
+        it stops at once."""
+        nonlocal latched
+        latched = f"{'a protocol violation' if layer == 'ipc' else 'a failure of its own'}: {reason}"
+        print(f"monitor: captured on {latched}", file=sys.stderr)
+        answer = {"v": 1, "captured": True, "error": latched}
+        try:
+            rec, cp, confined = capture(mon, spaces, layer, reason, call)
+            answer["quarantine"] = {"record": rec, "checkpoint": cp}
+        except Exception as e:
+            print(f"monitor: the capture could not be recorded: {e!r}", file=sys.stderr)
+            confined = False
+        try: send_frame(sock, answer)
+        except OSError: return False
+        return confined
+
     try:
         while True:
             try:
                 data = recv_frame(sock, MAX_REQUEST)
-                if data is None: return 0                       # the gate hung up
+            except ValueError as e:                             # a frame it cannot read past
+                if latched is None:
+                    ending = PROTOCOL_EXIT; latch("ipc", str(e), "")
+                return ending
+            except OSError:                                     # the gate hung up, replies unread
+                return ending
+            if data is None: return ending                      # the gate hung up
+            if latched is not None:                             # captured: nothing runs
+                try: send_frame(sock, {"v": 1, "captured": True, "error": latched})
+                except OSError: return ending                   # the gate hung up
+                continue
+            try:
                 req = check_request(data, seq)
                 op, args = req["op"], req["args"]
                 named = args.get("space", args.get("source"))
@@ -437,41 +505,49 @@ def serve(fd, workdir, policy_hash, vow_hash, quarantine=""):
                 if op == "open_space" and args["kind"] not in KINDS: raise ValueError(f"no kind {args['kind']!r}")
                 if op == "quarantine" and not _reportable(args): raise ValueError("not a refusal the gate may report")
             except ValueError as e:
-                print(f"monitor: protocol violation: {e}", file=sys.stderr); return PROTOCOL_EXIT
-            reply = {"v": 1, "seq": seq, "ok": True}
-            if op == "checkpoint":
-                reply["block"] = mon.end_run()
-            elif op == "jail_status":
-                import jail
-                reply["jail"], reply["why"] = jail.available()
-            elif op == "open_space":
-                if len(spaces) > MAX_SPACES:
-                    reply.update(space=None, error=f"more than {MAX_SPACES} spaces open")
+                ending = PROTOCOL_EXIT
+                if not latch("ipc", str(e), data.decode("utf-8", "replace")): return ending
+                continue
+            try:
+                reply = {"v": 1, "seq": seq, "ok": True}
+                if op == "checkpoint":
+                    reply["block"] = mon.end_run()
+                elif op == "jail_status":
+                    import jail
+                    reply["jail"], reply["why"] = jail.available()
+                elif op == "open_space":
+                    if len(spaces) > MAX_SPACES:
+                        reply.update(space=None, error=f"more than {MAX_SPACES} spaces open")
+                    else:
+                        root = tempfile.mkdtemp(prefix=args["kind"] + "_"); copy = os.path.join(root, "w")
+                        try:
+                            clone_confined_snapshot(spaces[named][1].workdir, copy)
+                            made += 1; sid = f"copy{made}"
+                            spaces[sid] = (root, Sandbox(copy, jail=True, logical_workdir=real, parse_trace=False))
+                            reply["space"] = sid
+                        except ConfinementViolation as e:
+                            shutil.rmtree(root, ignore_errors=True)
+                            reply.update(space=None, error=f"the workdir cannot be copied: {e}")
+                elif op == "close_space":
+                    root, sb = spaces.pop(named); sb.close(); shutil.rmtree(root, ignore_errors=True)
+                elif op == "quarantine":
+                    rec, cp = mon.report_refusal(args["layer"], args["reason"], args["call"], args["context"])
+                    reply["quarantine"] = {"record": rec, "checkpoint": cp}
                 else:
-                    root = tempfile.mkdtemp(prefix=args["kind"] + "_"); copy = os.path.join(root, "w")
-                    try:
-                        clone_confined_snapshot(spaces[named][1].workdir, copy)
-                        made += 1; sid = f"copy{made}"
-                        spaces[sid] = (root, Sandbox(copy, jail=True, logical_workdir=real, parse_trace=False))
-                        reply["space"] = sid
-                    except ConfinementViolation as e:
-                        shutil.rmtree(root, ignore_errors=True)
-                        reply.update(space=None, error=f"the workdir cannot be copied: {e}")
-            elif op == "close_space":
-                root, sb = spaces.pop(named); sb.close(); shutil.rmtree(root, ignore_errors=True)
-            elif op == "quarantine":
-                rec, cp = mon.report_refusal(args["layer"], args["reason"], args["call"], args["context"])
-                reply["quarantine"] = {"record": rec, "checkpoint": cp}
-            else:
-                sb = spaces[named][1]
-                kwargs = {k: v for k, v in args.items() if k != "space"}
-                mon.quarantined = None
-                reply["result"] = dispatch(sb, op, kwargs)       # the fixed tool table (F4)
-                reply["record"] = mon.records[-1] if named == "real" else None
-                if mon.quarantined is not None:                  # a call it ran and refused
-                    reply["quarantine"] = dict(zip(("record", "checkpoint"), mon.quarantined))
-                sb.calls.clear()
-            send_frame(sock, reply)
+                    sb = spaces[named][1]
+                    kwargs = {k: v for k, v in args.items() if k != "space"}
+                    mon.quarantined = None
+                    reply["result"] = dispatch(sb, op, kwargs)       # the fixed tool table (F4)
+                    reply["record"] = mon.records[-1] if named == "real" else None
+                    if mon.quarantined is not None:                  # a call it ran and refused
+                        reply["quarantine"] = dict(zip(("record", "checkpoint"), mon.quarantined))
+                    sb.calls.clear()
+            except Exception as e:                              # a failure of the monitor's own
+                ending = INVARIANT_EXIT
+                if not latch("monitor", type(e).__name__, data.decode("utf-8", "replace")): return ending
+                continue
+            try: send_frame(sock, reply)
+            except OSError: return ending                       # the gate hung up
             seq += 1
     finally:
         for root, sb in spaces.values():
@@ -535,14 +611,20 @@ class RemoteMonitor:
         try: send_frame(self._sock, {"v": 1, "seq": self._seq, "op": op, "args": args})
         except OSError as e: raise MonitorGone(f"the monitor process is gone: {e}") from None
         resp = self._recv()
+        if resp.get("captured"):
+            self._keep(resp)
+            raise MonitorCaptured(f"the monitor is captured, on {resp.get('error')}")
         if resp.get("seq") != self._seq or not resp.get("ok"):
             raise MonitorGone(f"the monitor answered out of turn: {str(resp)[:120]}")
         self._seq += 1
+        self._keep(resp)
+        return resp
+
+    def _keep(self, resp):
         q = resp.get("quarantine")
         if q is not None:
             if q.get("record") is not None: self.quarantine_records.append(q["record"])
             self.quarantine_checkpoint = q.get("checkpoint")
-        return resp
 
     def report_refusal(self, layer, reason, call, context=""):
         """A refusal the gate decided (a Vow or guard refusal), into the monitor's stream."""

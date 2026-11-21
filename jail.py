@@ -5,17 +5,22 @@
 # runs an approved shell command for real, inside a jail, under strace, and
 # turns what the trace shows into effects in the same vocabulary the Vow uses.
 #
-#   prevention   bubblewrap: the whole filesystem read-only except the
-#                workdir, a fresh /tmp, no network, its own process and IPC
-#                namespaces (kill -9 -1 reaches nothing outside), no new
-#                privileges, killed with its parent
+#   prevention   bubblewrap: only the system directories and a short list of
+#                /etc's files, read-only (no home directories, no /run where
+#                the host's daemons listen, no /var); the workdir the only
+#                writable path; a fresh /tmp; no network; its own process and
+#                IPC namespaces (kill -9 -1 reaches nothing outside); no new
+#                privileges; killed with its parent
 #                confine.py, inside it: Landlock lets the command read only
 #                the system directories and write only the workdir, whatever
 #                call it opens a file with; seccomp refuses the calls that
 #                open or execute a file out of strace's sight (openat2,
-#                execveat, io_uring, file handles), so the trace is complete
+#                execveat, io_uring, file handles), so the trace is complete,
+#                and refuses Unix sockets, so a socket file the binds missed
+#                stays out of reach
 #   detection    strace -f: every exec, open, connect, unlink, rename and
-#                kill, including the ones the jail refused. An attempt is
+#                kill, including the ones the jail refused. A connect to a
+#                Unix socket file is judged as a write to that path. An attempt is
 #                an effect: trying to write /etc is the harm the Vow names,
 #                whether or not the jail let it land.
 #
@@ -45,6 +50,35 @@ LOADER_READS = ("/etc/ld.so.", "/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/", "
                 "/etc/terminfo/", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/hosts",
                 "/etc/resolv.conf", "/etc/host.conf", "/etc/gai.conf", "/etc/locale.alias")
 WRITE_FLAGS = ("O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND")
+# glibc asks nscd before it reads /etc/passwd: libc's doing, as LOADER_READS.
+LIBC_SOCKETS = ("/run/nscd/socket", "/var/run/nscd/socket")
+
+# What of the host the jail sees, all of it read-only. The system directories
+# (a merged-/usr symlink is recreated as a symlink), and from /etc only what
+# programs read to start, to name owners and hosts, to find their alternatives
+# and their locale. Not /etc itself: a jail started as root could read
+# /etc/shadow and the host's SSH keys there.
+SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+ETC = ("ld.so.cache", "ld.so.conf", "ld.so.conf.d",                     # the loader
+       "nsswitch.conf", "passwd", "group", "hosts", "host.conf",        # names
+       "gai.conf", "resolv.conf", "protocols", "services", "networks",
+       "localtime", "timezone", "locale.alias", "locale.conf",          # time, locale
+       "alternatives", "terminfo", "mime.types", "magic", "magic.mime",  # programs
+       "ssl/certs", "os-release", "lsb-release", "debian_version", "hostname")
+
+def _etc_entries():
+    # Debian's Pythons keep sitecustomize under /etc/python3.X.
+    extra = sorted(e for e in os.listdir("/etc") if re.fullmatch(r"python3(\.\d+)?", e))
+    return list(ETC) + extra
+
+def _system_binds():
+    out = []
+    for d in SYSTEM_DIRS:
+        if os.path.islink(d): out += ["--symlink", os.readlink(d), d]
+        elif os.path.isdir(d): out += ["--ro-bind", d, d]
+    for e in _etc_entries():
+        out += ["--ro-bind-try", "/etc/" + e, "/etc/" + e]
+    return out
 
 class JailUnavailable(Exception): pass
 
@@ -82,7 +116,7 @@ def _bwrap(workdir, source=None):
     # same paths it saw the first time)
     w = os.path.realpath(workdir)
     s = os.path.realpath(source) if source else w
-    return ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp", "--bind", s, w, "--chdir", w,
+    return ["bwrap", *_system_binds(), "--tmpfs", "/tmp", "--bind", s, w, "--chdir", w,
             "--dev", "/dev", "--proc", "/proc", "--unshare-all", "--die-with-parent",
             "--new-session", "--cap-drop", "ALL",
             # A clean environment: the host's may hold tokens, and its loader
@@ -194,7 +228,15 @@ def parse(per_pid, cmd):
                     write = call == "creat" or any(f in args for f in WRITE_FLAGS)
                     events.append(("write" if write else "read", _where(args, strs[0], rest, ok), ok))
             elif call == "connect":
-                if "AF_UNIX" in args: continue             # local sockets are not the network
+                if "AF_UNIX" in args:
+                    # A socket file is a path, and connecting to it delivers
+                    # bytes to whatever listens there. An abstract name (@...)
+                    # lives in the jail's own network namespace.
+                    m = re.search(r'sun_path=("(?:[^"\\]|\\.)*")', args)
+                    if m:
+                        p = _unescape(m.group(1)[1:-1])
+                        events.append(("unix", os.path.realpath(p) if p.startswith("/") else p, ok))
+                    continue
                 ip = re.search(r'inet_addr\("([^"]+)"\)|inet_pton\(AF_INET6, "([^"]+)"', args)
                 events.append(("connect", (ip.group(1) or ip.group(2)) if ip else args[:80], ok))
             elif call in ("unlinkat", "unlink"):
@@ -243,6 +285,14 @@ def effects_of(events, workdir, policy=None):
             for path in detail: _touch_path(path, workdir, effects, True, pol)
         elif kind == "connect":
             effects.update({"network_access", "network_unlisted"})
+        elif kind == "unix":
+            # Judged as a write to the socket's path: outside the workdir it is
+            # write_outside_workdir, whatever listens there. A relative path
+            # resolves against a working directory the trace does not show, so
+            # it is taken to be outside.
+            if detail in LIBC_SOCKETS: continue
+            if not detail.startswith("/"): effects.update({"write", "write_outside_workdir"}); continue
+            _touch_path(detail, workdir, effects, True, pol)
         elif kind == "kill":
             if detail.startswith("-"): effects.add("dominate")   # a whole process group, or everyone
     return effects

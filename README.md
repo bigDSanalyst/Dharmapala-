@@ -349,7 +349,8 @@ right. The code and results are kept on the branch `claude/unified-math-framewor
 This breaks the jail one bubblewrap flag, or one part of `confine.py`, at a
 time and checks that a containment probe catches each break as an escape. The
 two layers are tested on their own: bubblewrap's flags are broken with
-`confine.py` switched off, so Landlock cannot hide a break in them. It exits 0
+`confine.py` switched off, and `confine.py` with the whole host mounted
+read-only, so neither layer can hide a break in the other. It exits 0
 only when every break is caught, and it names each flag no probe here can
 observe, with the reason. CI runs it as an unprivileged user and as root.
 

@@ -20,15 +20,19 @@ from tests.test_jail import needs_jail
 ALLOWED = {"x86_64": {"read": 0, "openat": 257, "execve": 59, "clone3": 435},
            "aarch64": {"read": 63, "openat": 56, "execve": 221, "clone3": 435}}
 DENY = confine.SECCOMP_RET_ERRNO | errno.ENOSYS
+REFUSE = confine.SECCOMP_RET_ERRNO | errno.EPERM
+SOCKETPAIR = {"x86_64": 53, "aarch64": 199}
 
 
-def verdict(prog, arch, nr):
-    """Run a classic-BPF program over seccomp_data {nr, arch}."""
+def verdict(prog, arch, nr, arg0=0):
+    """Run a classic-BPF program over seccomp_data {nr, arch, args[0]}, laid
+    out as on a little-endian machine: args[0]'s low word at 16, high at 20."""
+    data = {0: nr, 4: arch, 16: arg0 & 0xFFFFFFFF, 20: arg0 >> 32}
     acc, pc = 0, 0
     while True:
         code, jt, jf, k = prog[pc]
         if code == confine.BPF_LD_W_ABS:
-            acc = {0: nr, 4: arch}[k]; pc += 1
+            acc = data[k]; pc += 1
         elif code == confine.BPF_JEQ_K:
             pc += 1 + (jt if acc == k else jf)
         elif code == confine.BPF_JGE_K:
@@ -43,11 +47,34 @@ def verdict(prog, arch, nr):
 def test_the_filter_refuses_exactly_the_untraced_calls(machine):
     arch, numbers = confine.SYSCALL_TABLES[machine]
     prog = confine.seccomp_program(machine)
-    assert set(numbers) == set(confine.DENIED)
+    assert set(numbers) == set(confine.DENIED) | {"socket"}
     for name in confine.DENIED:
         assert verdict(prog, arch, numbers[name]) == DENY, name
     for name, nr in ALLOWED[machine].items():
         assert verdict(prog, arch, nr) == confine.SECCOMP_RET_ALLOW, name
+
+
+@pytest.mark.parametrize("machine", sorted(confine.SYSCALL_TABLES))
+def test_unix_sockets_are_refused_and_nothing_else_is(machine):
+    arch, numbers = confine.SYSCALL_TABLES[machine]
+    prog = confine.seccomp_program(machine)
+    assert verdict(prog, arch, numbers["socket"], arg0=1) == REFUSE              # AF_UNIX
+    assert verdict(prog, arch, numbers["socket"], arg0=2) == confine.SECCOMP_RET_ALLOW   # AF_INET
+    assert verdict(prog, arch, numbers["socket"], arg0=10) == confine.SECCOMP_RET_ALLOW  # AF_INET6
+    # socketpair is how programs talk among their own processes; it stays.
+    assert verdict(prog, arch, SOCKETPAIR[machine], arg0=1) == confine.SECCOMP_RET_ALLOW
+
+
+@pytest.mark.parametrize("machine", sorted(confine.SYSCALL_TABLES))
+def test_the_family_is_read_as_the_kernel_reads_it(machine):
+    """The kernel truncates socket()'s domain to an int. A filter that compared
+    all 64 bits would let 1 | 1 << 32 through, and the kernel would make an
+    AF_UNIX socket of it; one that read the high word would miss plain 1."""
+    arch, numbers = confine.SYSCALL_TABLES[machine]
+    prog = confine.seccomp_program(machine)
+    assert verdict(prog, arch, numbers["socket"], arg0=1 | 1 << 32) == REFUSE
+    assert verdict(prog, arch, numbers["socket"], arg0=1 | 0xFFFF << 40) == REFUSE
+    assert verdict(prog, arch, numbers["socket"], arg0=2 | 1 << 32) == confine.SECCOMP_RET_ALLOW
 
 
 @pytest.mark.parametrize("machine", sorted(confine.SYSCALL_TABLES))
@@ -68,9 +95,11 @@ def test_x32_calls_are_refused():
 # The numbers again, written down separately from confine.py's table, from
 # arch/x86/entry/syscalls/syscall_64.tbl and include/uapi/asm-generic/unistd.h.
 REFERENCE = {"x86_64": {"openat2": 437, "execveat": 322, "io_uring_setup": 425, "io_uring_enter": 426,
-                        "io_uring_register": 427, "open_by_handle_at": 304, "name_to_handle_at": 303},
+                        "io_uring_register": 427, "open_by_handle_at": 304, "name_to_handle_at": 303,
+                        "socket": 41},
              "aarch64": {"openat2": 437, "execveat": 281, "io_uring_setup": 425, "io_uring_enter": 426,
-                         "io_uring_register": 427, "open_by_handle_at": 265, "name_to_handle_at": 264}}
+                         "io_uring_register": 427, "open_by_handle_at": 265, "name_to_handle_at": 264,
+                         "socket": 198}}
 HEADERS = {"x86_64": pathlib.Path("/usr/include/x86_64-linux-gnu/asm/unistd_64.h"),
            "aarch64": pathlib.Path("/usr/include/asm-generic/unistd.h")}
 
@@ -85,7 +114,7 @@ def test_the_syscall_numbers_match_the_installed_headers(machine):
     if not HEADERS[machine].exists():
         pytest.skip(f"{HEADERS[machine]} not installed (linux-libc-dev)")
     text = HEADERS[machine].read_text()
-    for name, nr in confine.SYSCALL_TABLES[machine][1].items():
+    for name, nr in [*confine.SYSCALL_TABLES[machine][1].items(), ("socketpair", SOCKETPAIR[machine])]:
         assert re.search(rf"#define __NR_{name}\s+{nr}\b", text), f"{machine} {name} is not {nr}"
 
 

@@ -67,8 +67,9 @@ def reach(pid):
     if fd >= 0: os.close(fd)
     return r
 
+with open("/proc/sys/kernel/perf_event_paranoid") as f: paranoid = int(f.read())
 out = {"uid": os.getuid(), "threads": gate_confine.threads(), "capabilities": gate_confine.capabilities(),
-       "reach": {name: reach(pid) for name, pid in targets.items()}}
+       "perf_event_paranoid": paranoid, "reach": {name: reach(pid) for name, pid in targets.items()}}
 own.kill(); own.wait()
 print(json.dumps(out))
 '''
@@ -86,7 +87,11 @@ def confined(tmp_path_factory):
 def test_the_confined_gate_cannot_reach_the_memory_of_its_monitors_or_co_signers(confined):
     reach = dict(confined["reach"])
     own = reach.pop("a process of its own")
-    assert set(own) == METHODS and set(own.values()) == {"reached"}, own        # each probe can see a way in
+    # Each probe can see a way in. Above 2, perf_event_paranoid may refuse a
+    # process without a capability perf even on its own children (Debian and
+    # Ubuntu kernels do), so perf is then no way in at all.
+    sees = METHODS if confined["perf_event_paranoid"] <= 2 else METHODS - {"perf_event_open"}
+    assert set(own) == METHODS and {m for m, r in own.items() if r == "reached"} >= sees, own
     for target, ways in reach.items():
         assert set(ways) == METHODS and set(ways.values()) <= REFUSED, (target, ways)
 

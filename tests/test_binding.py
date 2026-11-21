@@ -87,7 +87,8 @@ def test_coq_rejects_a_certificate_that_states_the_wrong_verdict():
     lie = replace(d, effects=())                 # claims nothing forbidden was observed
     cert = build_certificate("x", {}, d)
     cert.witnesses[-1] = replace(cert.witnesses[-1], statement=lie.coq_statement())
-    ok, out = Certificate.check(cert.emit())
+    with cert.emitted() as path:
+        ok, out = Certificate.check(path)
     if ok is None: pytest.skip(out)
     assert ok is False
 
@@ -97,25 +98,25 @@ def test_the_cosigner_refuses_a_verdict_it_does_not_reach(binary):
     cert = build_certificate("x", engine(INPUTS), lie)
     p = propose("g", "guard", binary[1], 0, INPUTS, cert, engine(INPUTS), "Co", decision=lie)
     with pytest.raises(RefusedToSign, match="decision mismatch"):
-        co.cosign(p, cert.emit(), INPUTS, binary[0], engine, decision=lie)
+        co.cosign(p, "", INPUTS, binary[0], engine, decision=lie)
 
 def test_the_cosigner_checks_the_certificate_it_builds_not_the_file_it_is_handed(binary):
     co = CoSigner(default_signer("Co")); d = Decision.of(act({"read"}), VOW)
     cert = build_certificate("x", engine(INPUTS), d)
     p = propose("g", "guard", binary[1], 0, INPUTS, cert, engine(INPUTS), "Co", decision=d)
-    decoy = Certificate("decoy").emit()           # an empty certificate coqc would accept
-    signed = co.cosign(p, decoy, INPUTS, binary[0], engine, decision=d)
-    assert signed.certificate_hash == cert.certificate_hash()
-    forged = replace(p, certificate_hash=Certificate("decoy").certificate_hash())
-    with pytest.raises(RefusedToSign, match="certificate hash"):
-        co.cosign(forged, decoy, INPUTS, binary[0], engine, decision=d)
+    with Certificate("decoy").emitted() as decoy:     # an empty certificate coqc would accept
+        signed = co.cosign(p, decoy, INPUTS, binary[0], engine, decision=d)
+        assert signed.certificate_hash == cert.certificate_hash()
+        forged = replace(p, certificate_hash=Certificate("decoy").certificate_hash())
+        with pytest.raises(RefusedToSign, match="certificate hash"):
+            co.cosign(forged, decoy, INPUTS, binary[0], engine, decision=d)
 
 def test_a_proposal_cannot_smuggle_a_decision_past_the_cosigner(binary):
     co = CoSigner(default_signer("Co")); d = Decision.of(act({"read"}), VOW)
     cert = build_certificate("x", engine(INPUTS), d)
     p = propose("g", "guard", binary[1], 0, INPUTS, cert, engine(INPUTS), "Co", decision=d)
     with pytest.raises(RefusedToSign, match="not shown"):
-        co.cosign(p, cert.emit(), INPUTS, binary[0], engine)
+        co.cosign(p, "", INPUTS, binary[0], engine)
 
 # --- records cite only their own attestation ----------------------------------------
 
@@ -162,12 +163,13 @@ def test_a_decoy_file_cannot_get_a_wrong_engine_signed_as_checked(binary):
     """The proposer hands coqc an empty certificate it will accept, while the
     certificate it hashed states wrong arithmetic. Checking the handed file
     would sign coqc-pass for a wrong engine."""
-    if Certificate.check(Certificate("probe").emit())[0] is None: pytest.skip("coqc unavailable")
+    with Certificate("probe").emitted() as probe:
+        if Certificate.check(probe)[0] is None: pytest.skip("coqc unavailable")
     co = CoSigner(default_signer("Co")); d = Decision.of(act({"read"}), VOW)
     out = wrong_engine(INPUTS); cert = build_certificate("x", out, d)
     p = propose("g", "guard", binary[1], 0, INPUTS, cert, out, "Co", decision=d)
     with pytest.raises(RefusedToSign, match="coqc"):
-        co.cosign(p, Certificate("decoy").emit(), INPUTS, binary[0], wrong_engine, decision=d)
+        co.cosign(p, "", INPUTS, binary[0], wrong_engine, decision=d)
 
 def test_the_certificate_hash_covers_what_its_statements_mean():
     """`violations = [E_exfiltrate]` holds for many observed sets; the preamble

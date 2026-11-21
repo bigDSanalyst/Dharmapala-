@@ -137,7 +137,12 @@ def test_no_snapshot_of_its_own_means_no_signature(tmp_path, binary, which):
     snap = {"none": lambda: None,
             "not its own": lambda: replay.take(work),
             "another workdir": lambda: co.snapshot(str(tmp_path / "elsewhere"))}[which]()
-    v, _, L = judged([("shell", {"cmd": "true"})], {"exec"}, work, co, binary, snap)
+    try:
+        v, _, L = judged([("shell", {"cmd": "true"})], {"exec"}, work, co, binary, snap)
+    finally:
+        # One the co-signer did not take, it refuses and so never lets go of:
+        # the test took it, and the test releases it.
+        if which == "not its own": replay.release(snap)
     assert v.kind == VerdictKind.FAILURE_REFUSAL and not L.attestations
     assert "snapshot" in v.reason
 

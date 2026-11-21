@@ -21,9 +21,18 @@ command line restricts its own process with Landlock to what it still needs:
 
 Landlock grants, it cannot subtract, so the workdir is simply not among them:
 a workdir inside any of these paths, or holding one of them, is refused
-before anything is restricted. Afterwards the gate checks that it really
-cannot open the workdir, and that it holds no descriptor into it (Landlock
-does not revoke a descriptor already open). Either failing is a refusal.
+before anything is restricted.
+
+It then gives up every capability (Phase 3, slice 3). Under Landlock the gate
+is refused ptrace, and the calls checked like it, on any process outside its
+domain: its monitors and co-signers, started before it confined itself. A
+capability reaches their memory by other ways, though: a gate running as
+root could still sample their stacks with perf. With no_new_privs set, as
+Landlock requires, no program it runs gets a capability back.
+
+Afterwards the gate checks that it really cannot open the workdir, that it
+holds no descriptor into it (Landlock does not revoke a descriptor already
+open), and that it holds no capability. Any of these failing is a refusal.
 
 A process under Landlock cannot mount anything, so it could not start a jail:
 everything that does runs in a monitor process, started before this.
@@ -48,6 +57,9 @@ EVERYTHING = (1 << 16) - 1
 REPLACE = WRITE_FILE | MAKE_REG | REMOVE_FILE
 # The rights that change what is there.
 WRITES = WRITE_FILE | MAKE_REG | REMOVE_FILE | TRUNCATE
+# Capabilities (include/uapi/linux/prctl.h, capability.h)
+PR_CAPBSET_DROP, PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL = 24, 47, 4
+CAPABILITY_VERSION_3 = 0x20080522
 
 SYSTEM = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/proc", "/sys")
 TOOLS = ("lean", "coqc")
@@ -138,9 +150,40 @@ def conflicts(workdir, rules):
                    if _within(w, p) or _within(p, w)})
 
 
+def threads():
+    with open("/proc/self/status") as f:
+        return next(int(line.split()[1]) for line in f if line.startswith("Threads:"))
+
+def capabilities():
+    """This process's capability sets, {"CapEff": bits, ...}, from /proc/self/status."""
+    with open("/proc/self/status") as f:
+        return {k: int(v, 16) for k, v in (line.split(":") for line in f if line.startswith("Cap"))}
+
+def drop_capabilities(libc):
+    """Give up every capability, for good: the ambient set, the bounding set,
+    and the effective, permitted and inheritable sets. The bounding set takes
+    CAP_SETPCAP to change; a process without it holds no capability it could
+    use, and no_new_privs keeps any program it runs from gaining one."""
+    import ctypes
+    libc.prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+    try:
+        with open("/proc/sys/kernel/cap_last_cap") as f: last = int(f.read())
+    except (OSError, ValueError):
+        last = 63
+    if capabilities().get("CapEff", 0) >> 8 & 1:          # CAP_SETPCAP
+        for cap in range(last + 1):
+            if libc.prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) != 0: C._fail(f"prctl(PR_CAPBSET_DROP, {cap})")
+    class Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+    class Data(ctypes.Structure):
+        _fields_ = [("effective", ctypes.c_uint32), ("permitted", ctypes.c_uint32), ("inheritable", ctypes.c_uint32)]
+    if libc.capset(ctypes.byref(Header(CAPABILITY_VERSION_3, 0)), (Data * 2)()) != 0: C._fail("capset")
+
 def check(workdir):
     """Refused unless this process can neither open the workdir nor holds a
-    descriptor into it."""
+    descriptor into it, and holds no capability."""
+    held = {k: f"{v:x}" for k, v in capabilities().items() if k != "CapBnd" and v}
+    if held: raise Refused(f"the gate still holds capabilities: {held}")
     w = os.path.realpath(workdir)
     try:
         fd = os.open(w, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -234,9 +277,13 @@ def confine_gate(workdir, files=(), anthropic=False, private=()):
     if abi < 1:
         shutil.rmtree(scratch, ignore_errors=True)
         raise Unavailable("this kernel has no Landlock")
+    if threads() != 1:          # Landlock and capabilities are a thread's: another would keep both
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise Refused(f"the gate has {threads()} threads; it is confined only while it has one")
     _reaper(scratch)
     try:
         _restrict(libc, abi, rules)
+        drop_capabilities(libc)
     except C.Refused as e:
         raise e if isinstance(e, Refused) else Refused(str(e)) from None
     os.environ["TMPDIR"] = scratch

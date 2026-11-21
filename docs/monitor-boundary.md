@@ -278,8 +278,13 @@ run. Landlock grants and cannot subtract, so the workdir is simply not among the
   first, as files, so no directory stays writable.
 - **Refused at startup:** a workdir inside any granted path, or holding one: the ledger, say, or the
   stored login, whose directory a refresh writes in.
-- **Checked afterwards:** that the gate cannot open the workdir and holds no descriptor into it,
-  since Landlock does not revoke one already open. Either failing is a refusal.
+- **No capability** (Phase 3, slice 3): it gives up every one, the bounding set included where it
+  may. With `no_new_privs`, as Landlock requires, no program it runs gets one back. A gate run as root
+  then reads only what uid 0 may read without them: a file another user keeps private is out of its
+  reach.
+- **One thread:** Landlock and capabilities are a thread's, so a gate with another thread is refused.
+- **Checked afterwards:** that the gate cannot open the workdir, holds no descriptor into it (Landlock
+  does not revoke one already open), and holds no capability. Any of these failing is a refusal.
 - **Unconfined, with a warning:** without Landlock, or without ML-DSA-65, when the monitor runs in the
   gate's own process.
 - **Library callers** (`setup()`, the tests) are not confined. Landlock is for good, so
@@ -314,7 +319,17 @@ today. The trajectory co-signer follows the same pattern.
   one's. Without its replay monitor, P2 takes no snapshot, so no shell call runs; file calls are still
   checked.
 - **It follows the session** (slice 2, §5): a run hidden from it ends its signing, and the process.
-- **Not yet:** what keeps the gate's process out of P2's memory, beyond `PR_SET_DUMPABLE`, is slice 3.
+- **The gate cannot reach its memory** (slice 3), nor P0's or P0''s (`tests/test_gate_memory.py`).
+  Each of these is refused: ptrace, `process_vm_readv`, `/proc/<pid>/mem`, `environ` and `maps`,
+  `pidfd_getfd`, and `perf_event_open` with samples of the user stack.
+  - **As another user than root,** `PR_SET_DUMPABLE` alone refuses them, confined or not.
+  - **As root, confined,** Landlock refuses the ptrace family on processes outside the gate's domain,
+    and P0, P2 and P0' were all started before the gate confined itself. But Landlock alone left the
+    rest: a root gate could still read their environment and memory maps, and open perf events that
+    sample their stacks (verified). It now gives up its capabilities, and is then refused all of
+    them, as any other user is.
+  - **As root, unconfined** (a library caller), nothing here applies: root reaches all of them every
+    way.
 
 **P3, Jail.** The bubblewrap jail as it is in `main` (#26, #27). `confine.py` runs inside bwrap, after
 the mounts and before the command, and applies:
@@ -634,7 +649,11 @@ This needs a decision first (§8, item 1).
   in P2 and in the gate's process alike (`tests/test_cosigner_follows.py`).
 - `PR_SET_DUMPABLE=0` in P0 and P2; seccomp in P1 denying `ptrace` and `process_vm_*`; separate uids
   where the platform allows (slice 3). *Done:* `PR_SET_DUMPABLE=0` in P0 (Phase 2, slice 2) and in P2
-  (slice 1).
+  (slice 1). *Slice 3:*
+  - **No seccomp:** Landlock already refuses the confined gate `ptrace` and `process_vm_*` on P0 and
+    P2, root included.
+  - **No capability in P1:** what Landlock left to a root gate needed one (§3, P2).
+  - **Separate uids** are §8, item 3.
 - Exit: P1 holds no key material. *Met (slice 1):*
   `tests/test_cosigner_process.py::test_the_gate_holds_no_key_material`.
 
@@ -648,6 +667,17 @@ This needs a decision first (§8, item 1).
    entries P1 sends as opaque bytes, size-capped and hash-chained, and never interprets them, so
    owning the ledger does not make it a parser.
 3. **Separate uids for P0 and P2**, or one uid with `PR_SET_DUMPABLE=0` and seccomp.
+   *Measured (Phase 3, slice 3):*
+   - With one uid, `PR_SET_DUMPABLE=0` in P0 and P2 and no capability in the confined gate, the
+     gate is refused every way into their memory that `tests/test_gate_memory.py` tries, as root
+     too. That needs no seccomp.
+   - Separate uids would add two things. The gate could not signal them; a gate that kills one ends
+     the session, which fails closed. And what they own, the workdir among it, would be out of reach
+     of an unconfined gate's file permissions too: of a library caller's, which Landlock does not
+     cover.
+   - They would take root, or a helper with privilege, to start P0 and P2 as another user.
+
+   *Proposed:* one uid. Still open.
 4. **Disclosure.** The repository is public. This document and `repro_openat2.py` describe an unfixed
    bypass, so land Phase 1 with them or before them. *Resolved:* Phase 1 (#26, #27) landed before
    either was published.

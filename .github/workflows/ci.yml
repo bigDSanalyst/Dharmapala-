@@ -38,6 +38,11 @@ jobs:
       # DHARMA_REQUIRE_OVERLAY makes a skip a failure.
       - name: CW-VFS on overlayfs (as root)
         run: sudo env "PATH=$PATH" DHARMA_REQUIRE_OVERLAY=1 python3 -m pytest -q tests/test_cw_vfs_overlay.py
+      # The gate's boundary around the memory of its monitor and co-signers, as
+      # root, where its capabilities are what would reach it (tests/test_gate_memory.py;
+      # two of its tests run only as root).
+      - name: The gate cannot reach the keys' memory (as root)
+        run: sudo env "PATH=$PATH" DHARMA_REQUIRE_JAIL=1 python3 -m pytest -q -rs tests/test_gate_memory.py
       # The demo exits 1 unless Lean, Coq, the jail and ML-DSA-65 all actually
       # ran, so a green run here means every layer ran, not just that nothing crashed.
       - name: Demo passes with every layer running

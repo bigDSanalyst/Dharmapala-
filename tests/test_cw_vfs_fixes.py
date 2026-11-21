@@ -139,11 +139,8 @@ def test_a_witness_with_two_devices_verifies_and_its_theorem_holds(tmp_path, per
         assert ok, why
     cert = build_certificate("d12", {"butterflies": []}, evidence={"workdir": str(tmp_path), "calls": sb.calls})
     assert "rdev =?" not in " ".join(w.statement for w in cert.witnesses)
-    path = cert.emit()
-    try:
+    with cert.emitted() as path:
         ok, out = Certificate.check(path)
-    finally:
-        os.remove(path)
     if ok is None:
         pytest.skip(f"coqc not available: {out}")
     assert ok, out

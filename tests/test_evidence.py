@@ -120,7 +120,7 @@ def proposal_for(a, co):
     outputs = engine(INPUTS)
     cert = build_certificate("x", outputs, d)
     return d, propose("G", "guard", hashlib.sha256(b"engine").hexdigest(), 0, INPUTS,
-                      cert, outputs, co.id, decision=d), cert.emit()
+                      cert, outputs, co.id, decision=d), ""   # it reads no file it is handed
 
 def cosign(co, a, binary, evidence, proposal=None):
     d, p, path = proposal_for(a, co)

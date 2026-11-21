@@ -116,7 +116,7 @@ def test_merit_needs_an_effect(binary):
 def proposal_for(run_fn, binary, inputs, co_id):
     out = run_fn(inputs); cert = Certificate("t"); b = out["butterflies"][0]
     for w in witness_zq_butterfly(3329, b["a"], b["b"], b["w"], b["ea"], b["eb"], 0): cert.add(w)
-    return propose("g", "guard", binary[1], 0, inputs, cert, out, co_id), cert.emit()
+    return propose("g", "guard", binary[1], 0, inputs, cert, out, co_id), ""   # a file it would not read
 
 def test_cosigner_refuses_when_the_rerun_disagrees(binary):
     co = CoSigner(default_signer("Co")); inputs = {"butterflies": [(5, 6, 7)]}

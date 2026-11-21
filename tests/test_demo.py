@@ -1,4 +1,6 @@
+import os
 import subprocess
+import tempfile
 
 import pytest
 
@@ -6,8 +8,19 @@ from tests.support import LAYER, ROOT, toolchain_missing
 import run_demo
 
 @pytest.fixture(scope="module")
-def result():
-    return run_demo.main()
+def result(tmp_path_factory):
+    """One run of the demo, with a temporary directory of its own: what it
+    leaves there is in left_behind."""
+    tmp = tmp_path_factory.mktemp("demo_tmp")
+    before, tempfile.tempdir = tempfile.tempdir, str(tmp)
+    try: res = run_demo.main()
+    finally: tempfile.tempdir = before
+    return dict(res, left_behind=sorted(os.listdir(tmp)))
+
+def test_the_demo_leaves_nothing_behind(result):
+    """Its own directory, the critic's dry runs, the guard's and co-signer's
+    certificates and what coqc wrote beside them: none of it outlives the run."""
+    assert result["left_behind"] == []
 
 def test_exit_code_is_honest_about_the_toolchain():
     """Exit 0 and ALL CHECKS PASS exactly when every layer really ran."""

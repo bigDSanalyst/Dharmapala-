@@ -256,6 +256,8 @@ run. Landlock grants and cannot subtract, so the workdir is simply not among the
     stored credentials. It cannot change the profile's config, so it cannot change where they are
     sent. It already holds the token it calls the model with; keeping the model's credentials out of
     P1 is not part of Phase 2.
+  - `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) in the environment is the stricter choice for a
+    hardened run. The SDK then reads none of the stored login, and the gate is granted none of it.
   - A profile whose `credentials_path` points elsewhere is not granted: the SDK fails to read it,
     before any refresh, and the agent stops.
   - A workload identity token named by `ANTHROPIC_IDENTITY_TOKEN_FILE` stays readable as the file it

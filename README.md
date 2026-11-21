@@ -72,6 +72,11 @@ this repository, the ledger, or the login `ant auth login` stored. Without
 Landlock, or without ML-DSA-65 (when the monitor runs in the agent's
 process), it runs unconfined and says so.
 
+With `ant auth login`, the confined process keeps read access to the stored
+login, its refresh token included, and may replace the stored credentials,
+as refreshing a token does. With `ANTHROPIC_API_KEY` set, it keeps none of
+that: for a hardened run, set the key.
+
 ### What actually happened
 
 After the model's answer, the agent prints an account of every call, built

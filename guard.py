@@ -108,7 +108,8 @@ class Guard:
                                action.id, self.id)
         outputs = re_run_fn(inputs)
         decision = Decision.of(action, vow)
-        cert = build_certificate(f"{self.id}_{self.ledger.next_record_index()}", outputs, decision)
+        ev = getattr(action, "_evidence", None)
+        cert = build_certificate(f"{self.id}_{self.ledger.next_record_index()}", outputs, decision, evidence=ev)
         cert_path = cert.emit()
         proposal = propose(engine_id=self.id, engine_name="guard",
                            binary_hash=binary_hash, epoch=self.ledger.next_record_index(),

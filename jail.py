@@ -134,9 +134,10 @@ def _confine(w):
     with open(CONFINE) as f: source = f.read()
     return ["python3", "-I", "-c", source, w, "--"]
 
-def run(cmd, workdir, timeout=None, _probe=False):
+def run(cmd, workdir, timeout=None, _probe=False, source=None):
     """Run `cmd` with sh inside the jail, traced. Raises JailUnavailable
-    rather than ever running it any other way."""
+    rather than ever running it any other way. source: a directory to mount at
+    the workdir's path in its place (a rehearsal's copy, see _bwrap)."""
     if shutil.which("bwrap") is None or shutil.which("strace") is None:
         raise JailUnavailable("bwrap and strace are both required; not running the command")
     timeout = TIMEOUT if timeout is None else timeout
@@ -145,7 +146,7 @@ def run(cmd, workdir, timeout=None, _probe=False):
     # -y: every fd is printed with the path it names - the directory a call is
     # relative to, and the file an open actually reached (symlinks resolved)
     argv = ["strace", "-ff", "-qq", "-y", "--decode-pids=pidns", "-s", "4096", "-e", f"trace={SYSCALLS}", "-o", trace,
-            *_bwrap(workdir), "sh", "-c", cmd]
+            *_bwrap(workdir, source=source), "sh", "-c", cmd]
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
         rc, out, err, to = p.returncode, p.stdout, p.stderr, False

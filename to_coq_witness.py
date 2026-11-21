@@ -1,6 +1,7 @@
 
 import hashlib, json, os, shutil, subprocess, tempfile
 from dataclasses import dataclass, replace
+from cw_vfs import CapabilityWitness, verify_witness_against_call
 
 @dataclass(frozen=True)
 class CoqWitness:
@@ -22,7 +23,7 @@ class Certificate:
             fd, path = tempfile.mkstemp(suffix=".v", prefix=f"pqv_{self.label}_")
             os.close(fd)
         lines = [f"(* CERTIFICATE: {self.label} *)",
-                 "Require Import ZArith.", "Open Scope Z_scope.", ""]
+                 "Require Import ZArith List Bool.", "Import ListNotations.", "Open Scope Z_scope.", ""]
         lines += self.preamble + ([""] if self.preamble else [])
         for w in self.witnesses:
             lines.append(f"Theorem {w.name} : {w.statement}.")
@@ -88,7 +89,7 @@ class DecisionError(Exception): pass
 def _hash(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
 
-def build_certificate(label, outputs, decision=None, q=3329):
+def build_certificate(label, outputs, decision=None, q=3329, evidence=None):
     # One construction for proposer and co-signer alike, so the co-signer can
     # rebuild the certificate it is asked to vouch for instead of trusting it.
     cert = Certificate(label)
@@ -100,6 +101,21 @@ def build_certificate(label, outputs, decision=None, q=3329):
         cert.add(CoqWitness(name="decision", statement=decision.coq_statement(),
                             engine_output={"verdict": decision.verdict},
                             engine_name="vow/decision"))
+    if isinstance(evidence, dict):
+        for idx, (tool, kwargs, result) in enumerate(evidence.get("calls", [])):
+            if tool in ("file_read", "file_write") and isinstance(result, dict) and "capability_witness" in result:
+                try:
+                    wit = CapabilityWitness.from_dict(result["capability_witness"])
+                except Exception as e:
+                    raise ValueError(f"call {idx} ({tool}) carries a malformed CW-VFS witness: {e}")
+                ok, why, (exp_op, exp_rel, exp_sha) = verify_witness_against_call(wit, tool, kwargs, result)
+                if not ok:
+                    raise ValueError(f"call {idx} ({tool}) failed CW-VFS witness check: {why}")
+                defs, stmt = wit.coq_definitions_and_statement(f"vfs_{idx}", exp_op, exp_rel, exp_sha)
+                cert.define(defs)
+                cert.add(CoqWitness(name=f"vfs_cap_{idx}", statement=stmt,
+                                    engine_output={"path": exp_rel, "sha256": exp_sha},
+                                    engine_name="cw_vfs/openat2"))
     return cert
 
 def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
@@ -116,12 +132,13 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
                        policy_hash=decision.policy_hash if decision else "")
 
 class CoSigner:
-    def __init__(self, signer, require_coqc=False, reexecute=False, policy=None):
+    def __init__(self, signer, require_coqc=False, reexecute=False, policy=None, require_vfs_witness=True):
         # reexecute: a jailed run is not taken on its trace's word. The
         # co-signer snapshots the workdir before the run and runs the plan
         # again itself against that snapshot (replay.py).
         self.id = signer.id; self._signer = signer
         self.require_coqc = require_coqc; self.reexecute = reexecute; self.notes = []
+        self.require_vfs_witness = require_vfs_witness
         # The one policy this co-signer vouches under: a decision judged under
         # any other is refused, however well its effects check out.
         import policy as policy_mod
@@ -195,6 +212,21 @@ class CoSigner:
                     self.notes.append("effects: MISMATCH")
                     raise RefusedToSign(f"co-signer observed {list(seen)} where the guard reports {list(decision.effects)}")
                 self.notes.append("effects: re-derived, match")
+                for tool, kwargs, result in evidence["calls"]:
+                    if tool in ("file_read", "file_write") and isinstance(result, dict) and result.get("ok"):
+                        if "capability_witness" not in result:
+                            if self.require_vfs_witness:
+                                self.notes.append("vfs_witness: MISSING")
+                                raise RefusedToSign(f"missing capability_witness on ok=True {tool}")
+                            continue
+                        try: wit = CapabilityWitness.from_dict(result["capability_witness"])
+                        except Exception as e:
+                            self.notes.append("vfs_witness: INVALID")
+                            raise RefusedToSign(f"malformed capability_witness: {e}")
+                        ok_w, why_w, _ = verify_witness_against_call(wit, tool, kwargs, result)
+                        if not ok_w:
+                            self.notes.append("vfs_witness: MISMATCH")
+                            raise RefusedToSign(f"capability_witness rejected: {why_w}")
                 jailed = any(t == "shell" and isinstance(r, dict) and r.get("jailed")
                              for t, _, r in evidence["calls"])
                 if self.reexecute and jailed:
@@ -203,7 +235,7 @@ class CoSigner:
             raise RefusedToSign("proposal carries a decision the co-signer was not shown")
         # Check the certificate this co-signer builds, not the file it was
         # handed: the handed file need not be the one whose hash was proposed.
-        own = build_certificate(f"cosign_{self.id}", recomputed, decision)
+        own = build_certificate(f"cosign_{self.id}", recomputed, decision, evidence=evidence)
         if own.certificate_hash() != proposal.certificate_hash:
             self.notes.append("certificate: MISMATCH")
             raise RefusedToSign("certificate hash mismatch")

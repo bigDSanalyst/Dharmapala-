@@ -39,8 +39,9 @@ call it proposes goes through the gate, in order:
    Claude is told which effect was forbidden.
 2. The call runs for real. Shell commands run in the jail, traced, where they
    can read only the system directories and write only the workdir. File tools
-   stay inside the workdir unless the Vow says otherwise. `http_get` never
-   reaches the network.
+   stay inside the workdir: each read and write is opened beneath a descriptor
+   pinned to it (`cw_vfs.py`), only plain files are read or written, and each
+   carries a witness the co-signer checks. `http_get` never reaches the network.
 3. The guard judges what actually ran. The co-signer checks it against the run
    record with its own trace parser, and the decision is proven, signed and
    written to the ledger.

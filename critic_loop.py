@@ -1,5 +1,6 @@
 
 import hashlib, json, pathlib, shutil, tempfile
+from cw_vfs import ConfinementViolation, clone_confined_snapshot
 from tools import Sandbox
 import policy as policy_mod
 from observation import observe
@@ -33,15 +34,18 @@ def effects_from_evidence(evidence, reread=None):
     if (effects - set(evidence["predicted"])) - {"read", "write", "exec"}: effects.add("diverged")
     return effects
 
-def execute(plan, dry_effects, workdir, jail=False, policy=None):
+def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir=None):
     """Run an accepted plan for real and observe what it did. Anything the
     real run shows that the dry run did not predict is also `diverged`, so a
     Vow can forbid whatever the critic never saw. Returns (effects, calls);
     evidence_of(calls, workdir, dry_effects) is what a co-signer re-checks."""
-    real = Sandbox(workdir, jail=jail)
-    for tool, kwargs in plan:
-        getattr(real, tool)(**kwargs)
-    return effects_from_evidence(evidence_of(real.calls, real.workdir, dry_effects, policy)), real.calls
+    real = Sandbox(workdir, jail=jail, logical_workdir=logical_workdir)
+    try:
+        for tool, kwargs in plan:
+            getattr(real, tool)(**kwargs)
+    finally:
+        real.close()
+    return effects_from_evidence(evidence_of(real.calls, real.logical_workdir, dry_effects, policy)), real.calls
 
 def rehearse(plan, dry_effects, workdir=None, policy=None):
     """Run the plan for real, in the jail, against a throwaway copy of the
@@ -52,10 +56,13 @@ def rehearse(plan, dry_effects, workdir=None, policy=None):
     copy = pathlib.Path(scratch) / "work"
     try:
         if workdir and pathlib.Path(workdir).is_dir():
-            shutil.copytree(workdir, copy, symlinks=True)
+            try: clone_confined_snapshot(workdir, copy)
+            except ConfinementViolation: return None
+            logical = workdir            # judged, and shown to commands, as the real workdir
         else:
-            copy.mkdir()
-        effects, calls = execute(plan, dry_effects, str(copy), jail=True, policy=policy)
+            copy.mkdir(); logical = None   # nothing there yet to stand in for
+        effects, calls = execute(plan, dry_effects, str(copy), jail=True,
+                                 policy=policy, logical_workdir=logical)
         if any(tool == "shell" and not result.get("jailed") for tool, _, result in calls):
             return None
         effects.discard("diverged")     # the rehearsal is the prediction, not a deviation from one

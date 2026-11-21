@@ -132,7 +132,8 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
                        policy_hash=decision.policy_hash if decision else "")
 
 class CoSigner:
-    def __init__(self, signer, require_coqc=False, reexecute=False, policy=None, require_vfs_witness=True):
+    def __init__(self, signer, require_coqc=False, reexecute=False, policy=None, require_vfs_witness=True,
+                 monitor=None, workdir=None):
         # reexecute: a jailed run is not taken on its trace's word. The
         # co-signer snapshots the workdir before the run and runs the plan
         # again itself against that snapshot (replay.py).
@@ -144,6 +145,13 @@ class CoSigner:
         import policy as policy_mod
         self.policy = policy_mod.of(policy)
         self._snapshots = set()
+        # monitor: the monitor's verifier (monitor.py). Given one, every run
+        # record must carry that monitor's signed session block for `workdir`,
+        # and every witness in it must be from the session's root (F3).
+        self.monitor = monitor
+        self.workdir = workdir
+        if monitor is not None and workdir is None:
+            raise ValueError("a co-signer that checks sessions needs the workdir they are for")
     def snapshot(self, workdir):
         """Copy the workdir before the run: what a replay will start from."""
         import replay
@@ -201,6 +209,13 @@ class CoSigner:
                     raise RefusedToSign(f"judged under policy {judged_under[:12]}, which this co-signer "
                                         f"does not vouch under (it holds {self.policy.hash()[:12]})")
                 self.notes.append("policy: accepted")
+                if self.monitor is not None:
+                    import monitor as monitor_mod
+                    try: monitor_mod.check_evidence(evidence, self.monitor, self.workdir, judged_under)
+                    except monitor_mod.SessionError as e:
+                        self.notes.append("session: REFUSED")
+                        raise RefusedToSign(f"session record: {e}")
+                    self.notes.append("session: signed, chained, witnesses bound to its root")
                 # Read the raw trace with the co-signer's own parser, not the
                 # events the guard's side parsed from it (witness.py).
                 import witness

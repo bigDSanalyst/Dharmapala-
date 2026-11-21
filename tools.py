@@ -3,7 +3,7 @@ import pathlib
 from cw_vfs import CapabilityDirJail
 
 class Sandbox:
-    def __init__(self, workdir, dry_run=False, jail=False, logical_workdir=None):
+    def __init__(self, workdir, dry_run=False, jail=False, logical_workdir=None, monitor=None):
         # jail=True: shell commands really run, inside jail.py's jail, traced.
         # Otherwise they are recorded and never run, as before. Either way a
         # dry run runs nothing.
@@ -13,6 +13,8 @@ class Sandbox:
         self.logical_workdir = (pathlib.Path(logical_workdir) if logical_workdir is not None
                                 else self.workdir)
         self._vfs = None
+        # monitor: the session's record (monitor.py); every call is chained in it.
+        self.monitor = None if dry_run else monitor
         if not dry_run:
             self.workdir.mkdir(parents=True, exist_ok=True)
             self._vfs = CapabilityDirJail(self.workdir, logical_workdir=logical_workdir)
@@ -23,6 +25,7 @@ class Sandbox:
             self._vfs.close()
     def _record(self, tool, kwargs, result):
         self.calls.append((tool, kwargs, result))
+        if self.monitor is not None: self.monitor.record(tool, kwargs, result)
     def file_read(self, path):
         kwargs = {"path": str(path)}
         if self.dry_run: r = {"ok": True, "dry_run": True}

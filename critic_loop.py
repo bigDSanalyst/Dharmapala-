@@ -7,14 +7,17 @@ from observation import observe
 from vow_lean import emit_vow_compliance
 from lake_critic import check, which_critic
 
-def evidence_of(calls, workdir, predicted, policy=None):
+def evidence_of(calls, workdir, predicted, policy=None, session=None):
     """What a real run left behind, as data anyone can re-derive the effects
     from: every call with its result (and, for jailed shell calls, the trace
     events), the workdir, what was predicted before it ran, and the policy
-    (policy.py) that gives the effects their meaning."""
-    return {"workdir": str(workdir), "predicted": sorted(predicted),
-            "policy": policy_mod.of(policy).to_dict(),
-            "calls": [[tool, kwargs, result] for tool, kwargs, result in calls]}
+    (policy.py) that gives the effects their meaning. `session`, when the run
+    was recorded by a monitor (monitor.py), is its signed session block."""
+    ev = {"workdir": str(workdir), "predicted": sorted(predicted),
+          "policy": policy_mod.of(policy).to_dict(),
+          "calls": [[tool, kwargs, result] for tool, kwargs, result in calls]}
+    if session is not None: ev["session"] = session
+    return ev
 
 def evidence_digest(evidence):
     return hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
@@ -34,22 +37,27 @@ def effects_from_evidence(evidence, reread=None):
     if (effects - set(evidence["predicted"])) - {"read", "write", "exec"}: effects.add("diverged")
     return effects
 
-def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir=None):
+def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir=None, monitor=None):
     """Run an accepted plan for real and observe what it did. Anything the
     real run shows that the dry run did not predict is also `diverged`, so a
     Vow can forbid whatever the critic never saw. Returns (effects, calls);
     evidence_of(calls, workdir, dry_effects) is what a co-signer re-checks.
     Every step is checked against the tool table before any of them runs:
-    a plan with one step that is not a known tool call (UnknownCall) runs nothing."""
+    a plan with one step that is not a known tool call (UnknownCall) runs nothing.
+    With a monitor, every call is recorded in its chain and the run ends on a
+    signed checkpoint, whether or not it finished: monitor.last_block."""
     for tool, kwargs in plan:
         check_call(tool, kwargs)
-    real = Sandbox(workdir, jail=jail, logical_workdir=logical_workdir)
+    if monitor is not None: monitor.begin_run()
+    real = Sandbox(workdir, jail=jail, logical_workdir=logical_workdir, monitor=monitor)
     try:
         for tool, kwargs in plan:
             dispatch(real, tool, kwargs)
     finally:
         real.close()
-    return effects_from_evidence(evidence_of(real.calls, real.logical_workdir, dry_effects, policy)), real.calls
+        session = monitor.end_run() if monitor is not None else None
+    return effects_from_evidence(evidence_of(real.calls, real.logical_workdir, dry_effects, policy,
+                                             session)), real.calls
 
 def rehearse(plan, dry_effects, workdir=None, policy=None):
     """Run the plan for real, in the jail, against a throwaway copy of the

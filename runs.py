@@ -19,6 +19,13 @@
 #   - every stored record hashes to the digest its entry names
 #   - every entry that ran is one the ledger signed, with the verdict it says
 #   - every run the ledger signed has an entry: none dropped from the end
+#   - every run the monitor recorded (monitor.py) is signed by the ledger's
+#     Monitor key, chains on from the session's run before it, and, where its
+#     record is stored, holds exactly its calls, with every witness from the
+#     session's root: none dropped, none edited, none from another workdir
+#
+# The session block is kept even for a withheld call: it holds only hashes,
+# and without it the chain would have a hole where that run was.
 #
 # Two kinds of entry are not calls but notes (outcome "note"): the
 # differences shown to the model in a reconcile turn, and whether its answer
@@ -68,6 +75,7 @@ class RunLog:
              "evidence": None if withheld else ev,
              "withheld": bool(withheld and ev is not None),
              "prev": self.entries[-1]["hash"] if self.entries else GENESIS}
+        if ev is not None and ev.get("session") is not None: e["session"] = ev["session"]
         e["hash"] = _entry_hash(e)
         self.entries.append(e)
         if self.path:
@@ -114,6 +122,38 @@ def verify(entries, ledger):
     seen = {e.get("evidence_digest") for e in entries if isinstance(e, dict)}
     missing = [d for d in signed if d not in seen]
     if missing: problems.append(f"{len(missing)} run(s) the ledger signed have no entry here")
+    return problems + _sessions(entries, ledger)
+
+MONITOR = "Monitor"
+
+def _sessions(entries, ledger):
+    """The monitor's chain across the entries: each session block signed by
+    the ledger's Monitor key, each run starting where the session's run before
+    it ended, and each stored record matching its block."""
+    import monitor as monitor_mod
+    problems, last = [], {}            # session -> (index, head) of its last checkpoint
+    blocks = [(i, e) for i, e in enumerate(entries) if isinstance(e, dict) and e.get("session") is not None]
+    if not blocks: return problems
+    v = ledger.verifiers.get(MONITOR)
+    if v is None: return [f"{len(blocks)} run(s) carry a monitor's session record, and the ledger has no {MONITOR} key"]
+    for i, e in blocks:
+        tag, b = f"run {i}", e["session"]
+        ev = e.get("evidence")
+        try:
+            if ev is not None and ev.get("session") != b:
+                raise monitor_mod.SessionError("its session block is not its run record's")
+            calls = [tuple(c) for c in ev["calls"]] if ev is not None else None
+            header = monitor_mod.check_block(b, v, calls=calls)
+            if calls is not None: monitor_mod.check_witnesses(header, calls)
+        except monitor_mod.SessionError as err:
+            problems.append(f"{tag}: {err}"); continue
+        start = b.get("from_checkpoint")
+        was = last.get(header["session"])
+        now = None if start is None else (start.get("index"), start.get("head"))
+        if now != was:
+            problems.append(f"{tag}: does not follow the session's run before it here "
+                            f"(a run the monitor recorded is missing)")
+        end = b["checkpoint"]; last[header["session"]] = (end["index"], end["head"])
     return problems
 
 def _show(s):

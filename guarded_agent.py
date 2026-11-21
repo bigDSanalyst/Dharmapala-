@@ -51,6 +51,7 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import answer_check, backends, jail, runs
+import monitor as monitor_mod
 import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
 from decision import forbidden_of
@@ -127,8 +128,10 @@ class _OneCall:
 
 class Gate:
     """Everything between a proposed tool call and its result."""
-    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner, policy=None, runs_log=None):
+    def __init__(self, vow, workdir, guard, co_signer, traj_cosigner, policy=None, runs_log=None,
+                 monitor=None):
         self.vow, self.workdir = vow, str(workdir)
+        self.monitor = monitor                       # the session's signed record (monitor.py)
         self.policy = policy_mod.of(policy)      # what the Vow's effects mean here
         self.guard, self.co_signer, self.traj_cosigner = guard, co_signer, traj_cosigner
         pathlib.Path(self.workdir).mkdir(parents=True, exist_ok=True)
@@ -162,11 +165,13 @@ class Gate:
         finally: self.co_signer.release(snap)
 
     def _run(self, call_id, name, args, plan, predicted, snap):
-        observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok, policy=self.policy)
+        observed, calls = execute(plan, predicted, self.workdir, jail=self.jail_ok, policy=self.policy,
+                                  monitor=self.monitor)
         # 3. The guard judges what ran; the co-signer checks the guard.
         action = Action(id=call_id, verb=name, domain="action")
         action._observed_effects = observed
-        action._evidence = evidence_of(calls, self.workdir, predicted, self.policy)
+        action._evidence = evidence_of(calls, self.workdir, predicted, self.policy,
+                                       session=self.monitor.last_block if self.monitor else None)
         action._snapshot = snap
         verdict = self.guard.engage(action, self.vow, self.co_signer, self.traj_cosigner,
                                     f"tool:{name}", {"tool_use_id": call_id}, _engine,
@@ -236,12 +241,18 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     """The gate and its ledger. The co-signer vouches under the same policy
     the gate judges by: a gate given another policy would be refused."""
     policy = policy_mod.of(policy)
+    vow = parse_vow(vow_source)
     ledger = Ledger(sangha_id="agent", path=ledger_path)
     guard = Guard("Guard", ledger)
-    s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
-    for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
-    gate = Gate(parse_vow(vow_source), workdir, guard, CoSigner(s_co, reexecute=True, policy=policy),
-                TrajectoryCoSigner(s_tr), policy=policy, runs_log=runs.RunLog(runs_path))
+    s_co, s_tr, s_mon = default_signer("CoSigner"), default_signer("Trajectory"), default_signer("Monitor")
+    for s in (s_co, s_tr, s_mon): ledger.register_verifier(verifier_for(s))
+    # The monitor states the session's workdir and root once, signed, and
+    # chains every real call; the co-signer holds its key and checks each run
+    # against it (monitor.py, docs/monitor-boundary.md section 5).
+    mon = monitor_mod.Monitor(s_mon, workdir, policy_hash=policy.hash(), vow_hash=vow.hash())
+    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=verifier_for(s_mon), workdir=workdir)
+    gate = Gate(vow, workdir, guard, co, TrajectoryCoSigner(s_tr), policy=policy,
+                runs_log=runs.RunLog(runs_path), monitor=mon)
     return gate, ledger
 
 def main(argv=None):

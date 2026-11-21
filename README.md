@@ -136,7 +136,8 @@ that signs the record, which the agent's process never sees. The co-signers
 run in a process of their own (`cosigner.py`), which holds the keys every
 attestation rests on and replays shell calls in a monitor of its own. The
 agent's process holds only their public keys. If that process ends, the
-agent runs nothing more in the session. To
+agent runs nothing more in the session. The co-signer follows the session:
+a run hidden from it ends its signing, and with it the session. To
 check the records against the ledger and that chain:
 
     python3 verify.py check ledger.json --pins pins.json --runs ledger.json.runs.jsonl \

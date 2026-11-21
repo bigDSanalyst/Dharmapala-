@@ -106,7 +106,8 @@ def _frame(payload):
                                                                      "decision": None, "evidence": None,
                                                                      "snapshot": None}}).encode()),
     _frame(monitor.canon({"v": 1, "seq": 1, "op": "snapshot", "args": {}}).encode()),
-], ids=["not-json", "unknown-op", "bad-handle", "not-an-attestation", "out-of-sequence"])
+    _frame(monitor.canon({"v": 1, "seq": 0, "op": "observe", "args": {"evidence": "a run"}}).encode()),
+], ids=["not-json", "unknown-op", "bad-handle", "not-an-attestation", "out-of-sequence", "not-a-run-record"])
 def test_a_request_that_is_not_exactly_a_known_operation_ends_the_co_signer(tmp_path, frame):
     """And with it every attestation: the gate runs nothing more, and nothing
     is signed or stored."""

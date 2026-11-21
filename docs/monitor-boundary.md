@@ -298,8 +298,8 @@ today. The trajectory co-signer follows the same pattern.
 - **The process:** undumpable and killed with its parent (`PR_SET_DUMPABLE` 0, `PR_SET_PDEATHSIG`). It
   serves no peer but its parent (`SO_PEERCRED`), on a socketpair with length-prefixed canonical JSON
   frames.
-- **Four operations,** with exactly their arguments and in sequence: `snapshot`, `release`, `cosign`
-  and `traj_cosign`. Anything else ends the process (exit 3).
+- **Five operations,** with exactly their arguments and in sequence: `snapshot`, `release`, `cosign`,
+  `traj_cosign`, and `observe` (slice 2). Anything else ends the process (exit 3).
 - **Values, not code.** P2 hashes its own binary and runs the engine it was built with: the gate's
   binary path and engine never cross. It rebuilds each attestation, decision, action and trajectory
   clause from its fields.
@@ -313,8 +313,8 @@ today. The trajectory co-signer follows the same pattern.
   in time or in turn, though it is still running, since its late answer would be read as the next
   one's. Without its replay monitor, P2 takes no snapshot, so no shell call runs; file calls are still
   checked.
-- **Not yet:** P2 keeps no state between calls (§5, slice 2 below). What keeps the gate's process out of
-  P2's memory, beyond `PR_SET_DUMPABLE`, is slice 3.
+- **It follows the session** (slice 2, §5): a run hidden from it ends its signing, and the process.
+- **Not yet:** what keeps the gate's process out of P2's memory, beyond `PR_SET_DUMPABLE`, is slice 3.
 
 **P3, Jail.** The bubblewrap jail as it is in `main` (#26, #27). `confine.py` runs inside bwrap, after
 the mounts and before the command, and applies:
@@ -417,9 +417,22 @@ and pinned like the other signers.
 - **`verify.py --runs`** checks the same offline, plus continuity: each run must start at the
   checkpoint the session's previous run ended on, so a dropped run shows even when its output was
   withheld.
-- **Not yet:** the co-signer keeps no state between calls, so it cannot see a run hidden from it
-  between two it was shown. `verify.py` sees that. A stateful co-signer is Phase 3, slice 2: since
-  slice 1, P2 lasts as long as the session, so it can keep that state.
+- **The co-signer follows the session** (Phase 3, slice 2). Before slice 2 it kept no state between
+  calls, so it could not see a run hidden from it between two it was shown; only `verify.py` could.
+  Since slice 1 it lasts as long as the session, and now it keeps, for each session, the checkpoint
+  the last run it was shown ended on:
+  - **Each run must start there.** One that does not means a run was hidden from it, which an honest
+    gate never does. It refuses that run and signs nothing more in the session, not even the hidden
+    run if it is shown later, and the gate runs nothing more. In its own process it also ends
+    (exit 3).
+  - **A run counts as shown once its session block checks,** whatever the co-signer then refuses it
+    for: effects it reads otherwise, a replay that differs, no snapshot to replay from.
+  - **A run the guard refuses before asking it to vouch is still shown to it** (`observe`): one the
+    Vow's trajectory clauses refuse, or the trajectory co-signer.
+  - **It signs no decision that cites no run of the session,** which it could not follow.
+  - `verify.py` still checks continuity offline, as above, and finds a run hidden past the gate, which
+    the gate's records do not have. A run the gate records but never shows the co-signer looks to
+    `verify.py` like any withheld run; the co-signer finds it.
 
 **Why not BLS12-381 aggregate signatures.** Dharmapala signs with ML-DSA-65, which is post-quantum.
 BLS is pairing-based and falls to a quantum attacker, so signing witnesses with it would downgrade the
@@ -617,7 +630,8 @@ This needs a decision first (§8, item 1).
 **Phase 3: keys out of P1.**
 - Move the co-signers into P2. *Done (slice 1):* `cosigner.py`.
 - A co-signer that remembers the session (slice 2): P2 refuses a run that does not start at the
-  checkpoint the last run it was shown ended on (§5).
+  checkpoint the last run it was shown ended on (§5). *Done (slice 2):* `CoSigner` (`to_coq_witness.py`),
+  in P2 and in the gate's process alike (`tests/test_cosigner_follows.py`).
 - `PR_SET_DUMPABLE=0` in P0 and P2; seccomp in P1 denying `ptrace` and `process_vm_*`; separate uids
   where the platform allows (slice 3). *Done:* `PR_SET_DUMPABLE=0` in P0 (Phase 2, slice 2) and in P2
   (slice 1).

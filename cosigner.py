@@ -43,7 +43,7 @@ MAX_RESPONSE = 1 << 20
 PROTOCOL_EXIT = 3
 OPS = {"snapshot": (), "release": ("handle",),
        "cosign": ("proposal", "inputs", "decision", "evidence", "snapshot"),
-       "traj_cosign": ("clauses", "prior_state", "action", "verdict")}
+       "traj_cosign": ("clauses", "prior_state", "action", "verdict"), "observe": ("evidence",)}
 
 class CoSignerGone(RuntimeError):
     """The co-signer process is not there to answer: nothing more is signed."""
@@ -159,6 +159,8 @@ def serve(fd, workdir, policy_json, monitor_scheme, monitor_public):
                     prior_state = tuple(_list(args["prior_state"]))
                     if not all(type(s) is int for s in prior_state): raise ValueError("a state is not an integer")
                     action, verdict = action_from(args["action"]), _str(args["verdict"])
+                elif op == "observe":
+                    evidence = _dict_or_none(args["evidence"])
             except (ValueError, TypeError, KeyError) as e:
                 print(f"cosigner: protocol violation: {e}", file=sys.stderr); return PROTOCOL_EXIT
             reply = {"v": 1, "seq": seq, "ok": True}
@@ -185,8 +187,13 @@ def serve(fd, workdir, policy_json, monitor_scheme, monitor_public):
                 reply["accepted"] = accepted
                 if accepted: reply["attestation"] = dataclasses.asdict(result)
                 else: reply["message"] = str(result)
+            elif op == "observe":
+                reply["observed"] = co.observe(evidence)
+            if co.gone: reply["gone"] = co.gone          # a run was hidden from it: it signs nothing more
             try: send_frame(sock, reply)
             except OSError: return 0
+            if co.gone:
+                print(f"cosigner: {co.gone}", file=sys.stderr); return PROTOCOL_EXIT
             seq += 1
     finally:
         for snap in held.values(): co.release(snap)
@@ -250,6 +257,7 @@ class CoSignerProcess:
         except CoSignerGone as e:
             self._gone = str(e); raise          # for good: it is not asked again
         self._seq += 1
+        if resp.get("gone"): self._gone = str(resp["gone"])       # it will sign nothing more, and says why
         return resp
 
     def close(self):
@@ -287,6 +295,11 @@ class RemoteCoSigner:
         if handle is None: return
         try: self._proc.call("release", handle=handle)
         except CoSignerGone: pass
+    def observe(self, evidence):
+        """A run it is not asked to vouch for, shown so it can follow the
+        session: None, or why it did not follow."""
+        try: return self._proc.call("observe", evidence=evidence).get("observed")
+        except CoSignerGone as e: return str(e)
     def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None,
                snapshot=None):
         """cert_path, binary_path and re_run_fn are the gate's: the co-signer

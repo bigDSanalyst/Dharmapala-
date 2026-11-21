@@ -21,6 +21,14 @@ class Verdict:
 STAGES = ["NOVICE", "PRACTITIONER", "TEACHER", "SENIOR", "ELDER", "DHARMAPALA"]
 GENESIS_HASH = "0" * 64
 
+def _shown(co_signer, action):
+    """A run the guard refuses before the co-signer is asked to vouch for it is
+    still shown to the co-signer, so it can follow the session
+    (to_coq_witness.CoSigner.observe): a run never shown to it ends its
+    signing for the session."""
+    observe = getattr(co_signer, "observe", None)
+    if observe is not None: observe(getattr(action, "_evidence", None))
+
 class Guard:
     def __init__(self, guard_id, ledger, genesis_hash=GENESIS_HASH):
         self.id = guard_id; self.ledger = ledger; self.genesis_hash = genesis_hash
@@ -91,11 +99,13 @@ class Guard:
             traj_verdict = "LEARNING" if immediate else "LAWFUL"
             ok, result = traj_cosigner.cosign(traj_clauses, prior, action, traj_verdict)
             if not ok:
+                _shown(co_signer, action)
                 return Verdict(VerdictKind.FAILURE_REFUSAL,
                                f"trajectory cosigner: {result}", action.id, self.id)
             traj_att = result; traj_ref = result.attestation_hash()
             prior_state = new_state
             if traj_verdict == "LEARNING":
+                _shown(co_signer, action)
                 self.ledger.store_attestation(traj_att)
                 self.record_refusal(
                     class_id=f"traj:{immediate[0]}",

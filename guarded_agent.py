@@ -135,7 +135,9 @@ class Gate:
         self.policy = policy_mod.of(policy)      # what the Vow's effects mean here
         self.guard, self.co_signer, self.traj_cosigner = guard, co_signer, traj_cosigner
         pathlib.Path(self.workdir).mkdir(parents=True, exist_ok=True)
-        self.jail_ok, self.jail_why = jail.available()
+        # The monitor runs every jail, so it is the one asked whether the jail works.
+        self.jail_ok, self.jail_why = (monitor.jail_status() if getattr(monitor, "jail_status", None)
+                                       else jail.available())
         me = pathlib.Path(__file__).resolve()
         self.binary_path = str(me)                   # the code that judges is the engine
         self.binary_hash = hashlib.sha256(me.read_bytes()).hexdigest()
@@ -151,7 +153,7 @@ class Gate:
             return self._out(call_id, name, args, "refused", f"shell is unavailable: no jail ({self.jail_why}); nothing ran")
         # 1. The critic: dry run, and for shell a rehearsal in the jail.
         critic = CriticLoop(_OneCall(name, args), self.vow, max_retries=1, verbose=False, policy=self.policy,
-                            guard=self.guard, rehearse=(name == "shell"))
+                            guard=self.guard, rehearse=(name == "shell"), monitor=self.monitor)
         predicted, ok, plan = critic.propose_and_verify(f"tool:{name}", workdir=self.workdir)
         if not ok:
             last = critic.attempts[-1] if critic.attempts else {}
@@ -257,7 +259,11 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     # runs here, under the same HMAC fallback as the other signers.
     mon = monitor_mod.start(workdir, policy_hash=policy.hash(), vow_hash=vow.hash())
     ledger.register_verifier(mon.verifier)
-    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=mon.verifier, workdir=workdir)
+    # The co-signer's snapshots and replays run in a monitor process of its
+    # own, not the gate's (docs/monitor-boundary.md, P2 "replays through its own P0").
+    own = monitor_mod.RemoteMonitor(workdir) if isinstance(mon, monitor_mod.RemoteMonitor) else None
+    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=mon.verifier, workdir=workdir,
+                  replay_monitor=own)
     gate = Gate(vow, workdir, guard, co, TrajectoryCoSigner(s_tr), policy=policy,
                 runs_log=runs.RunLog(runs_path), monitor=mon)
     return gate, ledger

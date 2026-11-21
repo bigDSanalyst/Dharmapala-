@@ -130,7 +130,9 @@ def test_http_get_never_reaches_the_network(tmp_path):
     assert r["is_error"] and "network_unlisted" in r["content"]
 
 def test_without_a_jail_no_shell_call_runs(tmp_path, monkeypatch):
+    # The monitor runs every jail, so the gate takes its word on whether one works.
     monkeypatch.setattr(ga.jail, "available", lambda: (False, "bwrap not installed"))
+    monkeypatch.setattr(ga.monitor_mod.RemoteMonitor, "jail_status", lambda self: (False, "bwrap not installed"))
     gate, _, client, _, _ = run(tmp_path, turn(call(1, "shell", cmd="echo ran > proof")))
     [r] = results(client, 1)
     assert r["is_error"] and "no jail" in r["content"]

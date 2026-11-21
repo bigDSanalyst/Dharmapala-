@@ -133,7 +133,7 @@ def propose(engine_id, engine_name, binary_hash, epoch, inputs, cert, outputs,
 
 class CoSigner:
     def __init__(self, signer, require_coqc=False, reexecute=False, policy=None, require_vfs_witness=True,
-                 monitor=None, workdir=None):
+                 monitor=None, workdir=None, replay_monitor=None):
         # reexecute: a jailed run is not taken on its trace's word. The
         # co-signer snapshots the workdir before the run and runs the plan
         # again itself against that snapshot (replay.py).
@@ -150,16 +150,25 @@ class CoSigner:
         # and every witness in it must be from the session's root (F3).
         self.monitor = monitor
         self.workdir = workdir
+        # replay_monitor: a monitor process of the co-signer's own (monitor.py),
+        # not the gate's: its snapshots and replays run there, so a jail that
+        # lies to the gate does not also lie to the replay.
+        self.replay_monitor = replay_monitor
         if monitor is not None and workdir is None:
             raise ValueError("a co-signer that checks sessions needs the workdir they are for")
     def snapshot(self, workdir):
         """Copy the workdir before the run: what a replay will start from."""
-        import replay
-        snap = replay.take(workdir); self._snapshots.add(snap)
+        import os, replay
+        m = self.replay_monitor
+        snap = replay.take_in(m) if m is not None and os.path.realpath(workdir) == m.workdir \
+            else replay.take(workdir)
+        self._snapshots.add(snap)
         return snap
     def release(self, snap):
+        """Once: a snapshot this co-signer still holds (the replay lets go of it,
+        and so does the gate, afterwards)."""
         import replay
-        if snap is not None: self._snapshots.discard(snap); replay.release(snap)
+        if snap is not None and snap in self._snapshots: self._snapshots.discard(snap); replay.release(snap)
     def cosign(self, proposal, cert_path, inputs, binary_path, re_run_fn, decision=None, evidence=None,
                snapshot=None):
         self.notes = []

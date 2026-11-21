@@ -16,8 +16,10 @@ def without(monkeypatch):
             monkeypatch.setattr(shutil, "which",
                                 lambda n, *a, **k: None if n == "coqc" else real_which(n, *a, **k))
         elif name == "jail":
-            import jail
+            import jail, monitor
             monkeypatch.setattr(jail, "available", lambda: (False, "removed by test"))
+            # the gate asks its monitor process, which runs every jail
+            monkeypatch.setattr(monitor.RemoteMonitor, "jail_status", lambda self: (False, "removed by test"))
         elif name == "dilithium-py":
             monkeypatch.setitem(sys.modules, "dilithium_py", None)
             monkeypatch.setitem(sys.modules, "dilithium_py.ml_dsa", None)

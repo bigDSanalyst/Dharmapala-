@@ -169,8 +169,9 @@ def test_the_guarded_agent_withholds_a_run_whose_trace_was_forged(tmp_path, monk
     import guarded_agent as ga
     import monitor as monitor_mod
     from tests.test_guarded_agent import Scripted, call, results, text, turn
-    monkeypatch.setattr(monitor_mod, "start", lambda workdir, policy_hash="", vow_hash="": monitor_mod.Monitor(
-        default_signer("Monitor"), workdir, policy_hash=policy_hash, vow_hash=vow_hash))
+    monkeypatch.setattr(monitor_mod, "start", lambda workdir, policy_hash="", vow_hash="", quarantine=None:
+                        monitor_mod.Monitor(default_signer("Monitor"), workdir, policy_hash=policy_hash,
+                                            vow_hash=vow_hash, quarantine=quarantine))
     gate, ledger = ga.setup(tmp_path / "work")
     forging(monkeypatch)
     client = Scripted(turn(call(1, "shell", cmd=SHADOW_SCRIPT)), turn(text("done"), stop="end_turn"))

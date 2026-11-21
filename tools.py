@@ -1,6 +1,13 @@
 
-import pathlib
+import errno, pathlib
 from cw_vfs import CapabilityDirJail
+
+def _failed(e):
+    """A file call cw_vfs refused, as its result: the message, and a code
+    (the errno's name, or the exception's) that says why without being read."""
+    num = getattr(e, "errno_code", None) or getattr(e, "errno", None)    # cw_vfs's, or the kernel's
+    code = errno.errorcode.get(num) if isinstance(num, int) else None
+    return {"ok": False, "error": str(e), "code": code or type(e).__name__}
 
 class Sandbox:
     def __init__(self, workdir, dry_run=False, jail=False, logical_workdir=None, monitor=None,
@@ -47,7 +54,7 @@ class Sandbox:
                      "truncated": truncated,
                      "content_sha256": wit.content_sha256,
                      "capability_witness": wit.to_dict()}
-            except Exception as e: r = {"ok": False, "error": str(e)}
+            except Exception as e: r = _failed(e)
         self._record("file_read", kwargs, r); return r
     def file_write(self, path, content):
         kwargs = {"path": str(path), "content": content}
@@ -59,7 +66,7 @@ class Sandbox:
                 r = {"ok": True, "bytes": len(content),
                      "content_sha256": wit.content_sha256,
                      "capability_witness": wit.to_dict()}
-            except Exception as e: r = {"ok": False, "error": str(e)}
+            except Exception as e: r = _failed(e)
         self._record("file_write", kwargs, r); return r
     def http_get(self, url):
         kwargs = {"url": url}

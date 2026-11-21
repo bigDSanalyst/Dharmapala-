@@ -138,7 +138,7 @@ def test_the_monitor_refuses_a_peer_that_is_not_its_parent(tmp_path):
     between: SO_PEERCRED names us, so it refuses to serve."""
     ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     inner = [sys.executable, "-E", "-s", str(ROOT / "monitor.py"), "serve", str(theirs.fileno()),
-             str(tmp_path / "work"), "", ""]
+             str(tmp_path / "work"), "", "", ""]
     middle = subprocess.run([sys.executable, "-c", "import subprocess, sys; sys.exit(subprocess.call("
                              f"{inner!r}, pass_fds=[{theirs.fileno()}]))"],
                             pass_fds=[theirs.fileno()], capture_output=True, text=True, timeout=60)

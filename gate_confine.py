@@ -46,6 +46,8 @@ EVERYTHING = (1 << 16) - 1
 # Replacing a file in a directory the way the SDK does: a temporary file made
 # beside it (MAKE_REG, WRITE_FILE), renamed over it (REMOVE_FILE).
 REPLACE = WRITE_FILE | MAKE_REG | REMOVE_FILE
+# The rights that change what is there.
+WRITES = WRITE_FILE | MAKE_REG | REMOVE_FILE | TRUNCATE
 
 SYSTEM = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/proc", "/sys")
 TOOLS = ("lean", "coqc")
@@ -196,8 +198,10 @@ def _restrict(libc, abi, rules):
         os.close(rfd)
 
 
-def confine_gate(workdir, files=(), anthropic=False):
-    """Restrict this process for good. Returns its scratch directory, now TMPDIR."""
+def confine_gate(workdir, files=(), anthropic=False, private=()):
+    """Restrict this process for good. Returns its scratch directory, now TMPDIR.
+    private: directories that are another process's to write (the monitor's
+    quarantine stream): refused if the gate could write them."""
     for f in files:
         if not os.path.isfile(f): raise Refused(f"{f} must exist before the gate is confined")
     scratch = tempfile.mkdtemp(prefix="gate_")
@@ -207,6 +211,12 @@ def confine_gate(workdir, files=(), anthropic=False):
         shutil.rmtree(scratch, ignore_errors=True)
         raise Refused(f"the workdir {os.path.realpath(workdir)} overlaps {bad[0]}, which the gate must keep "
                       f"reaching; choose a workdir outside it")
+    for path in private:
+        hit = conflicts(path, [(p, r) for p, r in rules if r & WRITES])
+        if hit:
+            shutil.rmtree(scratch, ignore_errors=True)
+            raise Refused(f"{os.path.realpath(path)} overlaps {hit[0]}, which the gate may write; "
+                          f"choose a directory outside it")
     libc = C._libc()
     abi = libc.syscall(C.SYS_LANDLOCK_CREATE_RULESET, None, 0, C.LANDLOCK_CREATE_RULESET_VERSION)
     if abi < 1:

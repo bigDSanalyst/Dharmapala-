@@ -1,5 +1,5 @@
 
-import hashlib, json, pathlib, shutil, tempfile
+import hashlib, json, os, pathlib, shutil, tempfile
 from cw_vfs import ConfinementViolation, clone_confined_snapshot
 from tools import Sandbox, check_call, dispatch
 import policy as policy_mod
@@ -60,11 +60,35 @@ def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir
     return effects_from_evidence(evidence_of(real.calls, real.logical_workdir, dry_effects, policy,
                                              session)), real.calls
 
-def rehearse(plan, dry_effects, workdir=None, policy=None):
+def _rehearse_in_space(plan, dry_effects, workdir, policy, monitor):
+    """rehearse(), in a copy the monitor process makes and runs (monitor.py):
+    the gate's process neither reads the workdir nor starts a jail."""
+    import monitor as monitor_mod
+    for tool, kwargs in plan:
+        check_call(tool, kwargs)
+    try: space = monitor.open_space("real", "rehearsal")
+    except monitor_mod.SpaceError: return None
+    try:
+        sb = monitor.space_sandbox(space)
+        for tool, kwargs in plan:
+            dispatch(sb, tool, kwargs)
+    finally:
+        monitor.close_space(space)
+    if any(tool == "shell" and not result.get("jailed") for tool, _, result in sb.calls):
+        return None
+    effects = effects_from_evidence(evidence_of(sb.calls, workdir, dry_effects, policy))
+    effects.discard("diverged")
+    return effects
+
+def rehearse(plan, dry_effects, workdir=None, policy=None, monitor=None):
     """Run the plan for real, in the jail, against a throwaway copy of the
     workdir it is meant for, and return what it did (None if the jail could
     not run it). The copy is what makes a rehearsal worth having: a script
-    already in the workdir is invisible to a dry run and runs here."""
+    already in the workdir is invisible to a dry run and runs here. Given
+    the session's monitor process, the copy is its (_rehearse_in_space)."""
+    if workdir and getattr(monitor, "open_space", None) and \
+            os.path.realpath(workdir) == monitor.workdir:
+        return _rehearse_in_space(plan, dry_effects, workdir, policy, monitor)
     scratch = tempfile.mkdtemp(prefix="rehearsal_")
     copy = pathlib.Path(scratch) / "work"
     try:
@@ -85,13 +109,14 @@ def rehearse(plan, dry_effects, workdir=None, policy=None):
 
 class CriticLoop:
     def __init__(self, agent, vow, lake_root='/content/dharma/lean',
-                 max_retries=3, verbose=True, guard=None, rehearse=False, policy=None):
+                 max_retries=3, verbose=True, guard=None, rehearse=False, policy=None, monitor=None):
         # rehearse=True: before a plan is accepted it runs for real in the
         # jail against a throwaway copy of its workdir, and the critic judges
         # what that run did as well as what the dry run predicted.
         self.agent = agent; self.vow = vow; self.lake_root = lake_root
         self.max_retries = max_retries; self.verbose = verbose
         self.guard = guard; self.rehearse = rehearse
+        self.monitor = monitor  # the session's monitor: a rehearsal runs in a copy it makes
         self.policy = policy_mod.of(policy)     # what the effects mean here (policy.py)
         self.attempts = []
         self.unchecked = 0      # attempts the critic could not judge at all
@@ -104,7 +129,8 @@ class CriticLoop:
             effects = observe(dry.calls, dry.workdir, self.policy)
             rehearsed = None
             if self.rehearse:
-                rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir, self.policy)
+                rehearsed = rehearse([(t, k) for t, k, _ in dry.calls], effects, workdir, self.policy,
+                                     monitor=self.monitor)
                 if rehearsed is None:
                     # Asked to rehearse and could not: the plan is not judged.
                     self.unchecked += 1

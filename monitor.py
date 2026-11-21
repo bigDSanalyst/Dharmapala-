@@ -203,8 +203,21 @@ import signal, socket, struct, subprocess, sys
 MAX_REQUEST = 1 << 20
 MAX_RESPONSE = 256 << 20
 PROTOCOL_EXIT = 3
-OPS = {"file_read": ("path",), "file_write": ("path", "content"), "shell": ("cmd",),
-       "http_get": ("url",), "checkpoint": ()}
+# A space is where a call runs: "real", the workdir itself, whose every call
+# is recorded in the session chain; or a copy, made by open_space from the
+# real workdir or from another copy (clone_confined_snapshot) and mounted at
+# the workdir's own path, for the critic's rehearsals and the co-signer's
+# snapshots and replays. A copy's calls are not recorded: they change nothing
+# real. An unknown space is a protocol violation, as an unknown op is.
+OPS = {"file_read": ("space", "path"), "file_write": ("space", "path", "content"), "shell": ("space", "cmd"),
+       "http_get": ("space", "url"), "checkpoint": (), "open_space": ("source", "kind"),
+       "close_space": ("space",), "jail_status": ()}
+# What a copy is for; its directory is named after it, as the gate's own copies were.
+KINDS = ("rehearsal", "snapshot", "replay")
+MAX_SPACES = 64
+
+class SpaceError(RuntimeError):
+    """The monitor could not make a copy of the workdir."""
 
 class MonitorGone(RuntimeError):
     """The monitor process is not there to answer: nothing more runs."""
@@ -264,8 +277,12 @@ def serve(fd, workdir, policy_hash, vow_hash):
     try: signer = MLDSASigner.generate("Monitor")
     except ImportError:
         send_frame(sock, {"v": 1, "refused": "no ML-DSA-65 (pip install dilithium-py)"}); return 1
+    import shutil, tempfile
+    from cw_vfs import ConfinementViolation, clone_confined_snapshot
     mon = Monitor(signer, workdir, policy_hash=policy_hash, vow_hash=vow_hash)
-    sb = Sandbox(workdir, jail=True, monitor=mon, parse_trace=False)
+    real = mon.header["workdir"]
+    spaces = {"real": (None, Sandbox(real, jail=True, monitor=mon, parse_trace=False))}
+    made = 0
     send_frame(sock, {"v": 1, "hello": {"header": mon.header, "header_signature": mon.header_signature,
                                          "scheme": signer.scheme, "public": signer.public_bytes().hex()}})
     seq = 0
@@ -275,18 +292,47 @@ def serve(fd, workdir, policy_hash, vow_hash):
                 data = recv_frame(sock, MAX_REQUEST)
                 if data is None: return 0                       # the gate hung up
                 req = check_request(data, seq)
+                op, args = req["op"], req["args"]
+                named = args.get("space", args.get("source"))
+                if named is not None and named not in spaces: raise ValueError(f"no space {named!r}")
+                if op == "close_space" and named == "real": raise ValueError("the real space is not closed")
+                if op == "open_space" and args["kind"] not in KINDS: raise ValueError(f"no kind {args['kind']!r}")
             except ValueError as e:
                 print(f"monitor: protocol violation: {e}", file=sys.stderr); return PROTOCOL_EXIT
-            op, args = req["op"], req["args"]
+            reply = {"v": 1, "seq": seq, "ok": True}
             if op == "checkpoint":
-                send_frame(sock, {"v": 1, "seq": seq, "ok": True, "block": mon.end_run()})
+                reply["block"] = mon.end_run()
+            elif op == "jail_status":
+                import jail
+                reply["jail"], reply["why"] = jail.available()
+            elif op == "open_space":
+                if len(spaces) > MAX_SPACES:
+                    reply.update(space=None, error=f"more than {MAX_SPACES} spaces open")
+                else:
+                    root = tempfile.mkdtemp(prefix=args["kind"] + "_"); copy = os.path.join(root, "w")
+                    try:
+                        clone_confined_snapshot(spaces[named][1].workdir, copy)
+                        made += 1; sid = f"copy{made}"
+                        spaces[sid] = (root, Sandbox(copy, jail=True, logical_workdir=real, parse_trace=False))
+                        reply["space"] = sid
+                    except ConfinementViolation as e:
+                        shutil.rmtree(root, ignore_errors=True)
+                        reply.update(space=None, error=f"the workdir cannot be copied: {e}")
+            elif op == "close_space":
+                root, sb = spaces.pop(named); sb.close(); shutil.rmtree(root, ignore_errors=True)
             else:
-                result = dispatch(sb, op, args)              # the fixed tool table (F4)
+                sb = spaces[named][1]
+                kwargs = {k: v for k, v in args.items() if k != "space"}
+                reply["result"] = dispatch(sb, op, kwargs)       # the fixed tool table (F4)
+                reply["record"] = mon.records[-1] if named == "real" else None
                 sb.calls.clear()
-                send_frame(sock, {"v": 1, "seq": seq, "ok": True, "result": result, "record": mon.records[-1]})
+            send_frame(sock, reply)
             seq += 1
     finally:
-        sb.close(); sock.close()
+        for root, sb in spaces.values():
+            sb.close()
+            if root: shutil.rmtree(root, ignore_errors=True)
+        sock.close()
 
 def start(workdir, policy_hash="", vow_hash=""):
     """The session's monitor: its own process when ML-DSA-65 is installed
@@ -353,7 +399,19 @@ class RemoteMonitor:
         if os.path.realpath(workdir) != self.workdir or \
                 (logical_workdir is not None and os.path.realpath(logical_workdir) != self.workdir):
             raise ValueError(f"this monitor serves {self.workdir}, not {workdir}")
-        return RemoteSandbox(self)
+        return RemoteSandbox(self, "real")
+
+    def open_space(self, source="real", kind="rehearsal"):
+        """A new copy of `source` (the real workdir, or a copy), mounted at the
+        workdir's path when commands run in it. Raises SpaceError if it cannot be made."""
+        r = self.call("open_space", source=source, kind=kind)
+        if r.get("space") is None: raise SpaceError(r.get("error", "no space"))
+        return r["space"]
+    def close_space(self, space): self.call("close_space", space=space)
+    def space_sandbox(self, space): return RemoteSandbox(self, space)
+    def jail_status(self):
+        r = self.call("jail_status")
+        return bool(r["jail"]), r["why"]
 
     def close(self):
         try: self._sock.close()
@@ -368,13 +426,13 @@ class RemoteSandbox:
     """A Sandbox whose calls the monitor process runs and records. The gate
     reads a shell call's raw trace itself (jail.parse)."""
     dry_run = False
-    def __init__(self, mon):
+    def __init__(self, mon, space="real"):
         import pathlib
-        self._mon = mon
+        self._mon, self.space = mon, space
         self.workdir = self.logical_workdir = pathlib.Path(mon.workdir)
         self.calls = []
     def _call(self, tool, **kwargs):
-        result = self._mon.call(tool, **kwargs)["result"]
+        result = self._mon.call(tool, space=self.space, **kwargs)["result"]
         if tool == "shell" and result.get("jailed"):
             import jail
             # None when the trace never shows the command starting: no events,

@@ -207,8 +207,17 @@ the monitor's ML-DSA-65 key, and it:
 
 It stores each raw trace and puts the trace's hash in the chain, but never parses it.
 
-*As built (slice 2):* `monitor.py serve`, for the real workdir. Rehearsal and replay copies are still
-made in P1, and move into P0 with slice 3.
+*As built (slices 2 and 3a):* `monitor.py serve`.
+- **Every jail run and every copy of the workdir happens in a monitor process:**
+  - the real call;
+  - the critic's rehearsal, in a copy space of the gate's monitor;
+  - the co-signer's snapshot and replay, in copy spaces of a second monitor process that is the
+    co-signer's own ("replays through its own P0"), so a jail that lies to the gate does not also lie
+    to the replay.
+- **The gate asks its monitor whether the jail works** (`jail_status`), and runs no jail itself.
+- **Copies are named for what they are for** (`rehearsal_`, `snapshot_`, `replay_`), as the gate's
+  own copies were. A command can still tell a copy by its mount's source, as before (§2, the
+  environmental-trojan limit).
 - **Started by the gate, not the other way round.** This proposal had P0 create the socketpair and P1
   inherit it. The gate starts P0 instead, so that a library caller or a test can use it without
   forking itself.
@@ -291,10 +300,15 @@ bwrap itself provides:
   is 212992 bytes by default (verified: a 300 KB message fails with `EMSGSIZE`), and a jailed run's
   raw trace can be longer. Requests are capped at 1 MiB; a larger length is refused before its payload
   is read.
-- **Operations:** `file_read {path}`, `file_write {path, content}`, `shell {cmd}`, `http_get {url}` and
-  `checkpoint {}`.
-  - There is one space, the real workdir. `open_space`, `close_space` and the `space` argument come
-    with slice 3's rehearsal and replay spaces.
+- **Operations:** `file_read {space, path}`, `file_write {space, path, content}`, `shell {space, cmd}`,
+  `http_get {space, url}`, `checkpoint {}`, `open_space {source, kind}`, `close_space {space}` and
+  `jail_status {}`.
+  - **Spaces:** a space is `real`, or a copy that `open_space` made from `real` or from another copy
+    (`clone_confined_snapshot`), mounted at the workdir's path when a command runs in it.
+  - **What is recorded:** only the real space's calls go into the session chain. A copy's calls change
+    nothing real.
+  - **Protocol violations:** an unknown space, closing `real`, or a `kind` other than `rehearsal`,
+    `snapshot` or `replay`. Copies are capped at 64.
   - `file_write` takes no `mode`.
   - `checkpoint` answers with the run's session block (§5).
 - **Violations:** a request that is not exactly the next `seq` and a known operation with its
@@ -462,8 +476,13 @@ This needs a decision first (§8, item 1).
 
 **Phase 2: P0 and IPC.**
 - Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
-  *Done for the real workdir (slice 2):* the monitor process and its client. Snapshots for rehearsal
-  and replay move with slice 3.
+  *Done (slices 2 and 3a):*
+  - the monitor process and its client;
+  - rehearsal copies in the gate's monitor;
+  - the co-signer's snapshots and replays in a monitor of its own.
+
+  The gate's process runs no jail and copies nothing (`tests/test_monitor_process.py`), which is what
+  Landlock on it (slice 3b) needs.
 - Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
   *Done, in-process:* `monitor.py` (slice 1).
 - Apply Landlock to P1 so it cannot open the workdir.

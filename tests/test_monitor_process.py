@@ -180,12 +180,17 @@ def test_the_gate_starts_no_jail_and_copies_nothing(tmp_path, monkeypatch):
     assert runs.verify(gate.runs.entries, L) == []
 
 
+def _ppid(pid):
+    with open(f"/proc/{pid}/stat") as f: return int(f.read().rsplit(")", 1)[1].split()[1])
+
 @needs_jail
 def test_the_co_signer_replays_in_a_monitor_of_its_own(tmp_path):
+    """Its own, and a child of the co-signer's process (cosigner.py), which
+    the gate holds no handle on."""
     gate, _ = ga.setup(tmp_path / "work")
-    own = gate.co_signer.replay_monitor
-    assert isinstance(own, monitor.RemoteMonitor) and own.pid != gate.monitor.pid
-    assert own.verifier.key_id() != gate.monitor.verifier.key_id()
+    p2 = gate.co_signer._proc
+    assert p2.replay_monitor_pid not in (gate.monitor.pid, p2.pid, os.getpid())
+    assert _ppid(p2.replay_monitor_pid) == p2.pid
     _, error = gate.run("c0", "shell", {"cmd": "echo hi > a.txt"})
     assert not error and "re-execution: match" in gate.co_signer.notes
 
@@ -213,4 +218,5 @@ def test_every_shell_call_of_a_session_is_replayed(tmp_path):
         detail, error = gate.run(f"c{i}", "shell", {"cmd": f"echo {i} > f{i}.txt"})
         assert not error, detail
         assert "re-execution: match" in gate.co_signer.notes
-    assert gate.co_signer.replay_monitor._proc.poll() is None        # still serving
+    p2 = gate.co_signer._proc
+    assert p2._proc.poll() is None and _ppid(p2.replay_monitor_pid) == p2.pid   # both still serving

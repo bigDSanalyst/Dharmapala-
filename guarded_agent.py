@@ -50,7 +50,8 @@ import argparse, hashlib, json, os, pathlib, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import answer_check, backends, jail, runs
+import answer_check, backends, jail, replay, runs
+import cosigner as cosigner_mod
 import monitor as monitor_mod
 import policy as policy_mod
 from critic_loop import CriticLoop, evidence_of, execute
@@ -149,6 +150,9 @@ class Gate:
         if name not in ARGS or not isinstance(args, dict) or set(args) != ARGS[name] \
                 or not all(isinstance(v, str) for v in args.values()):
             return self._out(call_id, name, args, "invalid", f"not a valid call to a known tool: {name}")
+        gone = getattr(self.co_signer, "gone", None)      # its process ended (cosigner.py): nothing can be signed
+        if gone:
+            return self._out(call_id, name, args, "refused", f"{gone}; nothing more runs in this session")
         if name == "shell" and not self.jail_ok:
             return self._out(call_id, name, args, "refused", f"shell is unavailable: no jail ({self.jail_why}); nothing ran")
         # 1. The critic: dry run, and for shell a rehearsal in the jail.
@@ -166,7 +170,10 @@ class Gate:
             return self._out(call_id, name, args, "refused",
                              f"refused before running: it would have effects the policy forbids: {', '.join(violations)}")
         # 2. Run it for real, after the co-signer has copied the workdir for itself.
-        snap = self.co_signer.snapshot(self.workdir) if name == "shell" and self.co_signer.reexecute else None
+        try: snap = self.co_signer.snapshot(self.workdir) if name == "shell" and self.co_signer.reexecute else None
+        except replay.Unreplayable as e:            # it could not replay the call, so it could not vouch for it
+            return self._out(call_id, name, args, "refused",
+                             f"the co-signer could not copy the workdir to replay this call ({e}); nothing ran")
         try: return self._run(call_id, name, args, plan, predicted, snap)
         finally: self.co_signer.release(snap)
 
@@ -264,8 +271,6 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     vow = parse_vow(vow_source)
     ledger = Ledger(sangha_id="agent", path=ledger_path)
     guard = Guard("Guard", ledger)
-    s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
-    for s in (s_co, s_tr): ledger.register_verifier(verifier_for(s))
     # The monitor states the session's workdir and root once, signed, and
     # chains every real call; the co-signer holds its public key and checks
     # each run against it (monitor.py, docs/monitor-boundary.md section 5). It
@@ -273,14 +278,22 @@ def setup(workdir, vow_source=DEFAULT_VOW, ledger_path=None, policy=None, runs_p
     # ML-DSA-65 is installed; without it a key would have to be shared, so it
     # runs here, under the same HMAC fallback as the other signers.
     mon = monitor_mod.start(workdir, policy_hash=policy.hash(), vow_hash=vow.hash(), quarantine=quarantine)
-    ledger.register_verifier(mon.verifier)
-    # The co-signer's snapshots and replays run in a monitor process of its
-    # own, not the gate's (docs/monitor-boundary.md, P2 "replays through its own P0").
-    own = monitor_mod.RemoteMonitor(workdir) if isinstance(mon, monitor_mod.RemoteMonitor) else None
-    co = CoSigner(s_co, reexecute=True, policy=policy, monitor=mon.verifier, workdir=workdir,
-                  replay_monitor=own)
-    gate = Gate(vow, workdir, guard, co, TrajectoryCoSigner(s_tr), policy=policy,
-                runs_log=runs.RunLog(runs_path), monitor=mon)
+    # The co-signers, and the keys every attestation in the ledger rests on,
+    # run in a process of their own whenever the monitor does (cosigner.py,
+    # P2): this process, which parses everything untrusted, holds only their
+    # public keys. The co-signer's snapshots and replays run there, in a
+    # monitor of its own. Without ML-DSA-65 they stay here, under HMAC keys.
+    p2 = cosigner_mod.start(workdir, policy, mon.verifier) if isinstance(mon, monitor_mod.RemoteMonitor) else None
+    if p2 is not None:
+        co, tr = p2.cosigner, p2.trajectory
+        keys = [co.verifier, tr.verifier]
+    else:
+        s_co, s_tr = default_signer("CoSigner"), default_signer("Trajectory")
+        co = CoSigner(s_co, reexecute=True, policy=policy, monitor=mon.verifier, workdir=workdir)
+        tr = TrajectoryCoSigner(s_tr)
+        keys = [verifier_for(s_co), verifier_for(s_tr)]
+    for v in keys + [mon.verifier]: ledger.register_verifier(v)
+    gate = Gate(vow, workdir, guard, co, tr, policy=policy, runs_log=runs.RunLog(runs_path), monitor=mon)
     return gate, ledger
 
 def main(argv=None):
@@ -333,7 +346,7 @@ def main(argv=None):
     try:
         gate, ledger = setup(workdir, args.vow.read_text() if args.vow else DEFAULT_VOW, args.ledger, pol, runs_path,
                              quarantine=args.quarantine)
-    except (monitor_mod.MonitorGone, monitor_mod.QuarantineError) as e:
+    except (monitor_mod.MonitorGone, monitor_mod.QuarantineError, cosigner_mod.CoSignerGone) as e:
         print(f"not starting: {e}", file=sys.stderr); return 1
     if not gate.jail_ok:
         print(f"warning: no jail ({gate.jail_why}); shell calls will be refused", file=sys.stderr)

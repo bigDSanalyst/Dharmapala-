@@ -1,8 +1,11 @@
 """CW-VFS on a real overlay filesystem (D12).
 
-An overlay whose lower layer is another filesystem reports one device for
-its directories and another for the files that come from the lower layer
-(Docker's and Colab's mounts can look like this). A jail that compared device
+An overlay whose lower layer is another filesystem, mounted without xino,
+reports one device for its directories and another for the files that come
+from the lower layer. (With xino, which newer kernels turn on by themselves,
+the overlay folds the layers' inode numbers into one space and reports its own
+device for everything; GitHub's runners do that. A host whose overlays are
+mounted without it, or whose kernel cannot do it, shows the split.) A jail that compared device
 numbers refused every read, write and snapshot there. This builds such an
 overlay itself (a tmpfs under an overlay), so it needs root to mount; CI runs
 it as root with DHARMA_REQUIRE_OVERLAY=1, which turns a skip into a failure."""
@@ -41,7 +44,10 @@ def overlay(tmp_path):
         (w / "sub").mkdir(parents=True); (w / "empty").mkdir()
         (w / "sub" / "f.txt").write_text("hello\n")
         (w / "run.sh").write_text("#!/bin/sh\n"); os.chmod(w / "run.sh", 0o755)
-        r = _mount("-t", "overlay", "overlay", "-o", f"lowerdir={lower},upperdir={upper},workdir={work}", str(merged))
+        opts = f"lowerdir={lower},upperdir={upper},workdir={work}"
+        r = _mount("-t", "overlay", "overlay", "-o", opts + ",xino=off", str(merged))
+        if r.returncode != 0:                      # a kernel too old to know xino has no xino
+            r = _mount("-t", "overlay", "overlay", "-o", opts, str(merged))
         if r.returncode != 0:
             _cannot(f"cannot mount an overlay: {r.stderr.strip()}")
         try:

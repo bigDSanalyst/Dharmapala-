@@ -54,7 +54,7 @@ inside the host that needed work, one is closed for containment and one is open:
 | F1 | Reads through untraced syscalls never reach the guard | fixed in #26 |
 | F2 | Signing keys share an address space with the parsers | open: Phase 3 |
 | F3 | Witnesses are not bound to the session's workdir | open: Phase 2 |
-| F4 | `critic_loop.execute` dispatches by name without an allowlist | open: Phase 2 |
+| F4 | `critic_loop.execute` dispatches by name without an allowlist | fixed: `tools.dispatch` (Phase 2) |
 | F5 | cw_vfs is not in `main`, and the versions in circulation have diverged | resolved in #28 and #29 |
 | F6 | Host Unix sockets are reachable from the jail | fixed in #27 |
 
@@ -108,6 +108,16 @@ Still true at `bb926a5`, where the function is in `cw_vfs.py` (#28). The session
 `getattr(real, tool)(**kwargs)` runs any `Sandbox` attribute the plan names. Through `Gate` this is safe,
 because `Gate.run` validates the name first. Any other caller is trusted blindly: a plan naming
 `__init__` would re-root the sandbox. `_OneCall.act` has the same pattern.
+
+Verified at `9a5b029`: a plan of `file_write first.txt`, `__init__` with another workdir, then
+`file_write planted.txt` writes `planted.txt` into the other directory. `__init__` also resets the
+sandbox's `calls`, so the record keeps only the planted write, judged as an ordinary write inside the
+workdir, and the first write is gone from it.
+
+**Fix.** Both call sites go through `tools.dispatch`, a fixed table of the four tools and exactly
+their arguments (`guarded_agent.ARGS` is the same table, and a test keeps them in step).
+`critic_loop.execute` checks every step before running any, so a plan with one bad step runs nothing
+(`tests/test_dispatch.py`).
 
 ### F5. cw_vfs is not in `main`, and the versions in circulation have diverged (verified)
 
@@ -398,7 +408,7 @@ This needs a decision first (§8, item 1).
 - Move the real operations, jail spawning and snapshots into `monitor.py`; P1 uses the client.
 - Add the session header, chained records and checkpoints, with the binding checks in `verify.py`.
 - Apply Landlock to P1 so it cannot open the workdir.
-- Replace every `getattr` dispatch with a table (F4).
+- Replace every `getattr` dispatch with a table (F4). *Done:* `tools.dispatch`.
 - Add the quarantine stream and the terminal capture latch (§5).
 - Trace the blocked syscalls as telemetry only, in both parsers, with a test pinning `--seccomp-bpf` off.
   *Done:* `tests/test_refused_calls.py`.

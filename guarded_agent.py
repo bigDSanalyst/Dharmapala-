@@ -58,6 +58,7 @@ from guard import Guard, VerdictKind
 from ledger import Ledger
 from signing import default_signer, verifier_for
 from to_coq_witness import CoSigner
+from tools import dispatch
 from trajectory import TrajectoryCoSigner
 from vow import Action, parse_vow
 
@@ -121,7 +122,7 @@ class _OneCall:
     """An 'agent' for the critic loop that proposes exactly the call Claude made."""
     def __init__(self, name, args): self.name, self.args = name, args; self.sandbox = None
     def act(self, goal, context=""):
-        getattr(self.sandbox, self.name)(**self.args)
+        dispatch(self.sandbox, self.name, self.args)
         return self.sandbox.calls
 
 class Gate:

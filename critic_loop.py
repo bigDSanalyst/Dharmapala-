@@ -1,7 +1,7 @@
 
 import hashlib, json, pathlib, shutil, tempfile
 from cw_vfs import ConfinementViolation, clone_confined_snapshot
-from tools import Sandbox
+from tools import Sandbox, check_call, dispatch
 import policy as policy_mod
 from observation import observe
 from vow_lean import emit_vow_compliance
@@ -38,11 +38,15 @@ def execute(plan, dry_effects, workdir, jail=False, policy=None, logical_workdir
     """Run an accepted plan for real and observe what it did. Anything the
     real run shows that the dry run did not predict is also `diverged`, so a
     Vow can forbid whatever the critic never saw. Returns (effects, calls);
-    evidence_of(calls, workdir, dry_effects) is what a co-signer re-checks."""
+    evidence_of(calls, workdir, dry_effects) is what a co-signer re-checks.
+    Every step is checked against the tool table before any of them runs:
+    a plan with one step that is not a known tool call (UnknownCall) runs nothing."""
+    for tool, kwargs in plan:
+        check_call(tool, kwargs)
     real = Sandbox(workdir, jail=jail, logical_workdir=logical_workdir)
     try:
         for tool, kwargs in plan:
-            getattr(real, tool)(**kwargs)
+            dispatch(real, tool, kwargs)
     finally:
         real.close()
     return effects_from_evidence(evidence_of(real.calls, real.logical_workdir, dry_effects, policy)), real.calls
